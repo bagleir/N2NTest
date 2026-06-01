@@ -1,0 +1,22 @@
+PRÉTRAITEMENT 
+    [1] Masque circulaire
+    [2] Frames corrompues  
+    [3] FPN
+    [4] Stabilisation
+    [5] Flicker + drift
+    [6] Banding
+        ↓
+ASSEMBLAGE DU PRÉTRAITEMENT
+    → Un script master qui enchaîne les 6 étapes
+      sur toute la banque de vidéos automatiquement
+        ↓
+DÉBRUITAGE
+    [7] Temporal Median
+    [8] FastDVDnet entraîné en mode N2N
+        ↓
+POST-TRAITEMENT
+    [9] CLAHE + Unsharp Mask
+        ↓
+ÉVALUATION
+    → Comparaison visuelle avant/après pipeline complète
+    → Vérification que la pulsation est préservée

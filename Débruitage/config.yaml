@@ -1,0 +1,93 @@
+# FastDVDnet N2N — Configuration
+# Tous les chemins sont relatifs à la racine du projet (Stage/)
+# (résolus automatiquement par train.py et inference.py)
+
+data:
+  # ── Sources vidéo ─────────────────────────────────────────────────────
+  # Lister ici TOUS les dossiers contenant des vidéos d'entraînement.
+  # Chaque dossier est scanné récursivement selon video_pattern.
+  video_dirs:
+    - "TemporelIntegrale"          # vidéos *_step7_temporal_median.avi
+    # - "AutreBanque"              # décommenter pour ajouter d'autres sources
+  video_pattern: "*.avi"           # accepte toutes les vidéos .avi
+
+  mask_path: "PretraitementIntegrale/mask.png"
+  patch_size: 128
+  frames_per_clip: 5
+  train_split: 0.80
+  val_split:   0.20
+
+  # ── Stratégie N2N ─────────────────────────────────────────────────────
+  # "B"    : bruit synthétique uniquement (recommandé — paires A non validées)
+  # "A"    : inter-vidéo uniquement (activer après validation ECC)
+  # "auto" : A si paires disponibles (70 %), B sinon
+  force_strategy: "B"
+
+  # Alignement ECC (stratégie A uniquement)
+  ecc_max_px:           3.0   # rejeter la paire si déplacement résiduel > N px
+  min_pair_correlation: 0.85  # rejeter si corrélation dans masque < seuil
+  ecc_validation_n:     20    # nb de paires testées au démarrage pour les stats
+
+  # ── Stratégie B — construction des paires ────────────────────────────
+  # Option 1 (recommandée) : paire temporelle — input=frame_t, target=frame_{t+offset}
+  #   Le bruit à t et t+offset est indépendant (capteur à des instants différents).
+  #   temporal_offset > 2 garantit que la target est hors de la fenêtre d'input.
+  temporal_offset: 5     # frames entre input et target (doit être > 2)
+
+  # Option 2 (fallback) : double bruit indépendant sur la même frame de base
+  #   utilisé si la vidéo est trop courte pour l'offset temporel
+  sigma_noise:   4.4     # std bruit gaussien (échelle 0-255)
+  poisson_scale: 0.5     # proportion bruit de Poisson (0 = gaussien pur)
+
+model:
+  features: 64
+
+training:
+  epochs:     100
+  batch_size: 8
+
+  lr:         1.0e-4
+
+  # Poids de la loss totale
+  w_l1:             0.70
+  w_ssim:           0.30
+  w_gradient:       0.10
+  lambda_temporal:  0.10
+  lambda_pulsation: 0.05
+  pulsation_threshold: 0.7
+
+  grad_clip: 1.0
+
+  optimizer: adam
+  scheduler: cosine
+
+  checkpoint_dir: "Débruitage/checkpoints"
+  samples_dir:    "Débruitage/training_samples"
+  save_every_n_epochs: 10
+  log_every_n_epochs:  5
+
+  mixed_precision: true
+  num_workers: 4
+  pin_memory:  true
+  # Réduit à 128 (était 512) — évite l'overfitting sur peu de vidéos
+  samples_per_epoch_multiplier: 128
+  recursive_video_scan: true
+
+  # ── Alertes de surveillance ────────────────────────────────────────────
+  # Alerte oscillation : seuil + tendance + epoch minimum
+  oscillation_std_threshold: 0.010   # std(val[-10:]) > seuil
+  oscillation_min_epoch:     40      # pas d'alerte avant cette epoch
+  stagnation_patience:       15      # alerte si pas d'amélioration pendant N epochs
+
+inference:
+  checkpoint: "Débruitage/checkpoints/best_model.pth"
+  output_dir: "Débruitage/denoised"
+
+  temporal_median:
+    window_size: 5
+    gaussian_weights: true
+
+  comparison:
+    enabled:   true
+    n_frames:  5
+    crop_size: 150
