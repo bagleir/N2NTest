@@ -142,13 +142,31 @@ def _upscale_video(input_path: str, output_path: str, size: int = PROJ_SIZE) -> 
     print(f"  Upscale vidéo → {Path(output_path).name}  ({total} frames, {size}×{size})")
 
 
-def _run_n2n(video_in: Path, video_out: Path, checkpoint: str, sdir: Path) -> bool:
-    """Lance inference.py en sous-processus. Retourne True si succès."""
+def _run_n2n(
+    video_in:   Path,
+    video_out:  Path,
+    checkpoint: str,
+    sdir:       Path,
+    mask_path:  Path,
+) -> bool:
+    """
+    Lance inference.py en sous-processus.
+
+    Le masque est toujours passé en chemin absolu via --mask pour éviter
+    que inference.py tente de le résoudre depuis config.yaml (chemin relatif
+    qui ne correspond pas au répertoire de travail courant).
+
+    Cas 6/7 reçoivent mask_1024.png (1024×1024) car les vidéos sont upscalées ;
+    sans ça numpy lève une erreur de forme dans np.where(mask > 0, ...).
+    Cas 9 reçoit le masque 512×512 original.
+    """
     print(f"  Lancement N2N : {video_in.name} → {video_out.name}")
+    print(f"  Masque         : {mask_path}")
     result = subprocess.run([
         sys.executable, str(sdir / "inference.py"),
         "--video",      str(video_in),
         "--checkpoint", checkpoint,
+        "--mask",       str(mask_path.resolve()),
         "--output",     str(video_out),
     ])
     if result.returncode != 0:
@@ -187,10 +205,11 @@ def _load_corrupted_frames(search_dirs: list[Path]) -> list[int]:
 
 
 def _comparison_grid(
-    cases: list[tuple[str, np.ndarray, np.ndarray]],
+    cases:       list[tuple[str, np.ndarray, np.ndarray]],
     output_path: Path,
-    frame_idx: int,
-    crop_size: int,
+    frame_idx:   int,
+    crop_size:   int,
+    title:       str = "",
 ) -> None:
     """Grille synthétique : N colonnes × 2 lignes (image complète / zoom)."""
     n = len(cases)
@@ -215,10 +234,10 @@ def _comparison_grid(
     axes[1, 0].set_ylabel(f"Zoom {crop_size}×{crop_size}\n(centre)",
                            fontsize=8, rotation=90, ha="center", va="center", labelpad=55)
 
-    plt.suptitle(
-        f"Comparaison pipeline — frame {frame_idx}  |  masque appliqué sur tous les cas",
-        fontsize=10,
+    suptitle = (f"{title}\n" if title else "") + (
+        f"frame {frame_idx}  |  masque appliqué sur tous les cas"
     )
+    plt.suptitle(suptitle, fontsize=10)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
     plt.close()
@@ -248,7 +267,8 @@ def run_comparison(
     vdir = out / "videos"
     vdir.mkdir(parents=True, exist_ok=True)
 
-    cases: list[tuple[str, np.ndarray, np.ndarray]] = []
+    # Dict {numéro_cas: (label, img, crop)} — permet de former les deux grilles finales.
+    case_data: dict[int, tuple[str, np.ndarray, np.ndarray]] = {}
 
     # ── Prétraitement ─────────────────────────────────────────────────────────
     _step("Prétraitement")
@@ -319,6 +339,13 @@ def run_comparison(
     mask_up      = cv2.resize(mask, (PROJ_SIZE, PROJ_SIZE), interpolation=cv2.INTER_NEAREST)
     mask_bool_up = mask_up.astype(bool)
 
+    # Sauvegarder le masque 1024×1024 pour l'inférence N2N sur vidéos upscalées
+    # (cas 6 et 7 : inference.py reçoit un chemin absolu et le charge tel quel).
+    mask_up_path = vdir / "mask_1024.png"
+    if not mask_up_path.exists():
+        cv2.imwrite(str(mask_up_path), mask_up)
+        print(f"  Masque 1024×1024 → {mask_up_path.name}")
+
     # ── Vidéo USM (sur vidéo upscalée) ───────────────────────────────────────
     _step(f"Vidéo USM sur 1024×1024  (sigma={sigma}  strength={strength})")
     p_usm = vdir / "04_usm.avi"
@@ -333,7 +360,7 @@ def run_comparison(
         _extract_masked_frame(str(base), frame_idx, mask_bool),
         out / "cas_01_base", f"frame{frame_idx:03d}", crop_size,
     )
-    cases.append(("1. Base\n(avant prétraitement)", img, crop))
+    case_data[1] = ("1. Base\n(avant prétraitement)", img, crop)
 
     # ── Cas 2 : après prétraitement (512×512) ────────────────────────────────
     _step(f"Cas 2 — Après prétraitement (frame {frame_idx})")
@@ -341,7 +368,7 @@ def run_comparison(
         _extract_masked_frame(str(p_preproc), frame_idx, mask_bool),
         out / "cas_02_preprocessed", f"frame{frame_idx:03d}", crop_size,
     )
-    cases.append(("2. Prétraitement", img, crop))
+    case_data[2] = ("2. Prétraitement", img, crop)
 
     # ── Cas 3 : après upscale + USM (1024×1024) ───────────────────────────────
     _step(f"Cas 3 — Après upscale + USM (frame {frame_idx})")
@@ -349,21 +376,21 @@ def run_comparison(
         _extract_masked_frame(str(p_usm), frame_idx, mask_bool_up),
         out / "cas_03_usm", f"frame{frame_idx:03d}", crop_size,
     )
-    cases.append(("3. Upscale\n+ USM", img, crop))
+    case_data[3] = ("3. Upscale\n+ USM", img, crop)
 
     # ── Cas 4 : prétraitement → upscale → projection ─────────────────────────
     _step("Cas 4 — Prétraitement + upscale + projection")
     projs4 = compute_projections(str(p_upscaled), mask_up, str(out / "cas_04_projection"))
     img, crop = _save_case(projs4[PROJ_KEY], out / "cas_04_projection",
                            f"projection_{PROJ_KEY}", crop_size)
-    cases.append((f"4. Projection\n({PROJ_KEY})", img, crop))
+    case_data[4] = (f"4. Projection\n({PROJ_KEY})", img, crop)
 
     # ── Cas 5 : upscale + USM → projection ───────────────────────────────────
     _step("Cas 5 — Upscale + USM + projection")
     projs5 = compute_projections(str(p_usm), mask_up, str(out / "cas_05_usm_projection"))
     img, crop = _save_case(projs5[PROJ_KEY], out / "cas_05_usm_projection",
                            f"projection_{PROJ_KEY}", crop_size)
-    cases.append((f"5. USM\n+ Projection", img, crop))
+    case_data[5] = (f"5. USM\n+ Projection", img, crop)
 
     # ── Pré-calcul Drizzle SR (cas 8, indépendant du checkpoint N2N) ─────────
     # Inséré dans `cases` après les cas N2N pour respecter l'ordre 1-9.
@@ -456,41 +483,43 @@ def run_comparison(
     else:
         print(f"  Checkpoint : {ckpt}")
 
-        # ── Cas 6 : N2N (sur upscaled) → projection ──────────────────────────
+        # ── Cas 6 : N2N (sur upscaled 1024) → projection ────────────────────
+        # mask_up_path = masque 1024×1024 : évite l'erreur de forme dans inference.py
         _step("Cas 6 — N2N sur upscalé + projection")
         p_n2n_pre = vdir / "n2n_upscaled.avi"
         ok = True
         if not p_n2n_pre.exists():
-            ok = _run_n2n(p_upscaled, p_n2n_pre, ckpt, sdir)
+            ok = _run_n2n(p_upscaled, p_n2n_pre, ckpt, sdir, mask_path=mask_up_path)
         else:
             print(f"  Cache trouvé : {p_n2n_pre.name}")
         if ok and p_n2n_pre.exists():
             projs6 = compute_projections(str(p_n2n_pre), mask_up, str(out / "cas_06_n2n_upscaled"))
             img, crop = _save_case(projs6[PROJ_KEY], out / "cas_06_n2n_upscaled",
                                    f"projection_{PROJ_KEY}", crop_size)
-            cases.append(("6. N2N (upscalé)\n+ Projection", img, crop))
+            case_data[6] = ("6. N2N (upscalé)\n+ Projection", img, crop)
 
-        # ── Cas 7 : N2N (sur USM upscalé) → projection ───────────────────────
+        # ── Cas 7 : N2N (sur USM upscalé 1024) → projection ─────────────────
         _step("Cas 7 — N2N sur USM upscalé + projection")
         p_n2n_usm = vdir / "n2n_usm.avi"
         ok = True
         if not p_n2n_usm.exists():
-            ok = _run_n2n(p_usm, p_n2n_usm, ckpt, sdir)
+            ok = _run_n2n(p_usm, p_n2n_usm, ckpt, sdir, mask_path=mask_up_path)
         else:
             print(f"  Cache trouvé : {p_n2n_usm.name}")
         if ok and p_n2n_usm.exists():
             projs7 = compute_projections(str(p_n2n_usm), mask_up, str(out / "cas_07_n2n_usm"))
             img, crop = _save_case(projs7[PROJ_KEY], out / "cas_07_n2n_usm",
                                    f"projection_{PROJ_KEY}", crop_size)
-            cases.append(("7. N2N (USM upscalé)\n+ Projection", img, crop))
+            case_data[7] = ("7. N2N (USM upscalé)\n+ Projection", img, crop)
 
-        # ── Cas 9 : N2N (512×512) → Drizzle SR → USM ─────────────────────────
+        # ── Cas 9 : N2N 512×512 → Drizzle SR → USM ───────────────────────────
+        # mask_png = masque 512×512 original (vidéo prétraitée non upscalée)
         _step("Cas 9 — N2N (prétraité 512×512) → Drizzle SR → USM")
         p_n2n_512            = vdir / "09_n2n_preproc_512.avi"
         p_drizzle_n2n_sr_usm = vdir / "09_drizzle_n2n_sr_usm.png"
         ok = True
         if not p_n2n_512.exists():
-            ok = _run_n2n(p_preproc, p_n2n_512, ckpt, sdir)
+            ok = _run_n2n(p_preproc, p_n2n_512, ckpt, sdir, mask_path=mask_png)
         else:
             print(f"  Cache trouvé : {p_n2n_512.name}")
         if ok and p_n2n_512.exists():
@@ -513,21 +542,46 @@ def run_comparison(
                 except Exception as exc9:
                     print(f"\n  ⚠ Drizzle SR (cas 9) échoué ({exc9}) — cas 9 ignoré")
 
-    # ── Cas 8 → ajouté après les cas N2N pour respecter l'ordre 1-9 ──────────
+    # ── Cas 8 → inséré après les cas N2N pour respecter l'ordre 1-9 ──────────
     if _c8_img is not None:
         img, crop = _save_case(_c8_img, out / "cas_08_drizzle_sr_usm", "projection", crop_size)
-        cases.append((_c8_label, img, crop))
+        case_data[8] = (_c8_label, img, crop)
     else:
         print("  Cas 8 ignoré (Drizzle SR et Lanczos SR ont tous deux échoué)")
 
-    # ── Cas 9 → ajouté en dernier si disponible ───────────────────────────────
+    # ── Cas 9 → inséré en dernier si disponible ───────────────────────────────
     if _c9_img is not None:
         img, crop = _save_case(_c9_img, out / "cas_09_drizzle_n2n_usm", "projection", crop_size)
-        cases.append(("9. N2N → Drizzle SR\n→ USM", img, crop))
+        case_data[9] = ("9. N2N → Drizzle SR\n→ USM", img, crop)
 
-    # ── Grille synthétique ────────────────────────────────────────────────────
-    if cases:
-        _comparison_grid(cases, out / "comparison_grid.png", frame_idx, crop_size)
+    # ── Deux grilles de comparaison ───────────────────────────────────────────
+    #
+    #   Grille 1 — Pipeline SR / projection  (sans N2N appliqué directement)
+    #     1 Base | 4 Projection | 5 USM+Proj | 8 Drizzle SR | 9 N2N→Drizzle SR
+    #
+    #   Grille 2 — Impact du débruitage N2N
+    #     1 Base | 5 USM+Proj | 6 N2N upscalé | 7 N2N USM | 9 N2N→Drizzle SR
+    #
+    # Les cas absents (checkpoint manquant, Drizzle SR échoué) sont simplement
+    # omis — la grille se rétrécit en conséquence.
+
+    def _make_grid(numbers: list[int], output_path: Path, title: str) -> None:
+        selected = [case_data[n] for n in numbers if n in case_data]
+        if selected:
+            _comparison_grid(selected, output_path, frame_idx, crop_size, title=title)
+        else:
+            print(f"  Aucun cas disponible pour la grille '{title}' — ignorée")
+
+    _make_grid(
+        [1, 4, 5, 8, 9],
+        out / "comparison_grid_sr.png",
+        "Grille 1 — Pipeline SR / Projection  (1 Base | 4 Proj | 5 USM+Proj | 8 Drizzle SR | 9 N2N→SR)",
+    )
+    _make_grid(
+        [1, 5, 6, 7, 9],
+        out / "comparison_grid_n2n.png",
+        "Grille 2 — Impact du débruitage N2N  (1 Base | 5 USM+Proj | 6 N2N upsc | 7 N2N USM | 9 N2N→SR)",
+    )
 
     elapsed = time.perf_counter() - t0
     print(f"\n{'═'*62}")
