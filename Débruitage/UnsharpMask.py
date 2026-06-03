@@ -425,6 +425,86 @@ def compare_usm(
     print(f"  Grille de comparaison → {output_path}")
 
 
+# ── CLI helpers ───────────────────────────────────────────────────────────────
+
+
+def _find_mask(video_path: Path, explicit_mask: str | None) -> Path | None:
+    """
+    Localise le masque associé à une vidéo.
+
+    Ordre de priorité :
+      1. --mask passé explicitement
+      2. <stem>_mask.png dans le même dossier  (ex. AUZ0752_mask.png)
+      3. mask.png dans le même dossier
+      4. mask.png dans le dossier parent
+    """
+    if explicit_mask:
+        p = Path(explicit_mask)
+        return p if p.exists() else None
+    for candidate in [
+        video_path.parent / f"{video_path.stem}_mask.png",
+        video_path.parent / "mask.png",
+        video_path.parent.parent / "mask.png",
+    ]:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _process_one(
+    video_in:  Path,
+    mask_path: Path,
+    out_dir:   Path,
+    sigma:     float,
+    strength:  float,
+    calibrate: bool,
+) -> None:
+    """Applique USM (ou génère la calibration) sur une vidéo unique."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mask = load_mask(str(mask_path))
+    stem = video_in.stem
+
+    print(f"\n[10] Unsharp Mask")
+    print(f"     Entrée  : {video_in}")
+    print(f"     Masque  : {mask_path}")
+
+    if calibrate:
+        out_calib = out_dir / f"{stem}_step10_usm_calibration.png"
+        print(f"\n  Mode calibration — grille 12 combinaisons → {out_calib}\n")
+        calibration_grid_usm(str(video_in), mask, str(out_calib))
+        print(
+            "\n  ── Comment utiliser la grille ──────────────────────────────\n"
+            "  1. Ouvrir le PNG à 100% dans un viewer d'images.\n"
+            "  2. Chaque ligne = sigma, chaque colonne = strength.\n"
+            "  3. Chercher la vignette où :\n"
+            "       • les vaisseaux fins sont plus nets (score L élevé)\n"
+            "       • pas de halo blanc autour des vaisseaux\n"
+            "       • le fond noir reste homogène (pas de bruit amplifié)\n"
+            "  4. Relancer sans --calibrate avec les valeurs choisies :\n"
+            f"     python UnsharpMask.py {video_in} --sigma S --strength A"
+        )
+    else:
+        out_video = out_dir / f"{stem}_step10_usm.avi"
+        out_cmp   = out_dir / f"{stem}_step10_usm_comparison.png"
+
+        print(f"     Sortie  : {out_video}")
+        print(f"     sigma={sigma}  strength={strength}\n")
+
+        apply_usm_to_video(
+            video_path  = str(video_in),
+            mask        = mask,
+            output_path = str(out_video),
+            sigma       = sigma,
+            strength    = strength,
+        )
+        compare_usm(
+            video_before = str(video_in),
+            video_after  = str(out_video),
+            mask         = mask,
+            output_path  = str(out_cmp),
+        )
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 
@@ -436,15 +516,21 @@ def main() -> None:
             "Step [10] — Unsharp Mask post-processing.\n\n"
             "Workflow recommandé :\n"
             "  1. python UnsharpMask.py <video.avi> --calibrate\n"
-            "  2. Ouvrir step10_usm_calibration.png, choisir les meilleurs paramètres\n"
-            "  3. python UnsharpMask.py <video.avi> --sigma S --strength A"
+            "  2. Ouvrir le PNG de calibration, choisir les meilleurs paramètres\n"
+            "  3. python UnsharpMask.py <video.avi> --sigma S --strength A\n\n"
+            "Mode dossier — traite TOUTES les vidéos .avi trouvées :\n"
+            "  python UnsharpMask.py dossier/ --sigma 1.0 --strength 0.5\n"
+            "  python UnsharpMask.py dossier/ --calibrate  (grille par vidéo)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("input",
-        help="Vidéo .avi à traiter (output step [9] CLAHE) ou dossier la contenant.")
+        help="Vidéo .avi à traiter, ou dossier contenant des vidéos .avi.")
     parser.add_argument("--mask", default=None,
-        help="Chemin vers mask.png (défaut : mask.png dans le même dossier).")
+        help=(
+            "Chemin vers mask.png partagé par toutes les vidéos. "
+            "Si absent, cherché automatiquement à côté de chaque vidéo."
+        ))
     parser.add_argument("--output-dir", default=None,
         help="Dossier de sortie (défaut : même dossier que la vidéo).")
     parser.add_argument("--calibrate", action="store_true",
@@ -456,64 +542,54 @@ def main() -> None:
     args = parser.parse_args()
 
     inp = Path(args.input)
+    if not inp.exists():
+        sys.exit(f"ERREUR : chemin introuvable : {inp}")
+
+    # ── Mode dossier — toutes les vidéos .avi, quel que soit leur nom ─────────
     if inp.is_dir():
-        video_in  = inp / "step9_clahe_usm.avi"
-        mask_path = inp / "mask.png"
-        out_dir   = inp
+        videos = sorted(inp.glob("*.avi"))
+        # Exclure les sorties USM déjà produites pour éviter de les re-traiter
+        videos = [v for v in videos if "_step10_usm" not in v.name]
+
+        if not videos:
+            sys.exit(f"ERREUR : aucune vidéo .avi trouvée dans {inp}")
+
+        out_dir = Path(args.output_dir) if args.output_dir else inp
+        print(f"\nMode batch : {len(videos)} vidéo(s) dans {inp}")
+        print(f"Dossier de sortie : {out_dir}\n")
+
+        failed: list[str] = []
+        for video_in in videos:
+            mask_path = _find_mask(video_in, args.mask)
+            if mask_path is None:
+                print(f"  [IGNORÉ] masque introuvable pour {video_in.name}")
+                failed.append(video_in.name)
+                continue
+            try:
+                _process_one(video_in, mask_path, out_dir,
+                             args.sigma, args.strength, args.calibrate)
+            except Exception as exc:
+                print(f"  [ERREUR] {video_in.name} : {exc}")
+                failed.append(video_in.name)
+
+        print(f"\n── Bilan ────────────────────────────────────────────────────")
+        print(f"  Traitées avec succès : {len(videos) - len(failed)}/{len(videos)}")
+        if failed:
+            print(f"  Échecs              : {', '.join(failed)}")
+
+    # ── Mode vidéo unique ──────────────────────────────────────────────────────
     else:
-        video_in  = inp
-        mask_path = Path(args.mask) if args.mask else inp.parent / "mask.png"
-        out_dir   = Path(args.output_dir) if args.output_dir else inp.parent
-
-    if not video_in.exists():
-        sys.exit(f"ERREUR : vidéo introuvable : {video_in}")
-    if not mask_path.exists():
-        sys.exit(f"ERREUR : masque introuvable : {mask_path}")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    mask = load_mask(str(mask_path))
-
-    print(f"\n[10] Unsharp Mask")
-    print(f"     Entrée  : {video_in}")
-    print(f"     Masque  : {mask_path}")
-
-    if args.calibrate:
-        out_calib = out_dir / "step10_usm_calibration.png"
-        print(f"\n  Mode calibration — grille 12 combinaisons → {out_calib}\n")
-        calibration_grid_usm(str(video_in), mask, str(out_calib))
-        print(
-            "\n  ── Comment utiliser la grille ──────────────────────────────\n"
-            "  1. Ouvrir step10_usm_calibration.png à 100% dans un viewer d'images.\n"
-            "  2. Chaque ligne = sigma, chaque colonne = strength.\n"
-            "  3. Chercher la vignette où :\n"
-            "       • les vaisseaux fins sont plus nets (score L élevé)\n"
-            "       • pas de halo blanc autour des vaisseaux\n"
-            "       • le fond noir reste homogène (pas de bruit amplifié)\n"
-            "  4. Lire les paramètres de la vignette choisie.\n"
-            "  5. Relancer sans --calibrate avec ces valeurs :\n"
-            "     python UnsharpMask.py <video.avi> --sigma S --strength A"
-        )
-    else:
-        out_video = out_dir / "step10_usm.avi"
-        out_cmp   = out_dir / "step10_usm_comparison.png"
-
-        print(f"     Sortie  : {out_video}")
-        print(f"     sigma={args.sigma}  strength={args.strength}\n")
-
-        apply_usm_to_video(
-            video_path  = str(video_in),
-            mask        = mask,
-            output_path = str(out_video),
-            sigma       = args.sigma,
-            strength    = args.strength,
-        )
-
-        compare_usm(
-            video_before = str(video_in),
-            video_after  = str(out_video),
-            mask         = mask,
-            output_path  = str(out_cmp),
-        )
+        mask_path = _find_mask(inp, args.mask)
+        if mask_path is None:
+            sys.exit(
+                f"ERREUR : masque introuvable pour {inp.name}\n"
+                f"  Cherché dans : {inp.parent}/<stem>_mask.png, "
+                f"{inp.parent}/mask.png, {inp.parent.parent}/mask.png\n"
+                f"  Ou préciser avec : --mask chemin/mask.png"
+            )
+        out_dir = Path(args.output_dir) if args.output_dir else inp.parent
+        _process_one(inp, mask_path, out_dir,
+                     args.sigma, args.strength, args.calibrate)
 
     print("\nDone.")
 
