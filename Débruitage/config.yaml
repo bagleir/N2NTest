@@ -25,18 +25,14 @@ data:
     enabled: true
     scales:
       - size:       128
-        weight:     0.70    # 70 % des samples
-        batch_size: 32
+        weight:     0.75    # 70 % des samples
+        batch_size: 64
         grad_clip:  1.0
       - size:       256
-        weight:     0.20    # 20 % des samples
-        batch_size: 8
+        weight:     0.25    # 20 % des samples
+        batch_size: 16
         grad_clip:  1.0
-      - size:       512
-        weight:     0.10    # 10 % des samples — frame entière (pas de crop)
-        batch_size: 2
-        grad_clip:  0.5     # plus conservateur sur grande image
-
+        
   # ── Stratégie N2N ─────────────────────────────────────────────────────
   # "B"    : bruit synthétique uniquement (recommandé — paires A non validées)
   # "A"    : inter-vidéo uniquement (activer après validation ECC)
@@ -49,7 +45,7 @@ data:
   ecc_validation_n:     20
 
   # ── Stratégie B — construction des paires ────────────────────────────
-  temporal_offset: 5     # frames entre input et target (doit être > 2)
+  temporal_offset: 3     # frames entre input et target (doit être > 2)
   sigma_noise:   4.4
   poisson_scale: 0.5
 
@@ -57,11 +53,11 @@ model:
   features: 64
 
 training:
-  epochs:        150      # augmenté (était 100)
+  epochs:        200      # augmenté (était 100)
   batch_size:    8        # utilisé uniquement si multi_scale.enabled=false
 
-  lr:            2.0e-4   # augmenté selon linear scaling rule (était 1.0e-4)
-  warmup_epochs: 5        # LR monte linéairement de lr/20 → lr sur ces epochs
+  lr:            1.0e-4   # augmenté selon linear scaling rule (était 1.0e-4)
+  warmup_epochs: 3        # LR monte linéairement de lr/20 → lr sur ces epochs
                           # puis CosineAnnealingLR jusqu'à la fin
 
   # Poids de la loss totale
@@ -79,19 +75,19 @@ training:
 
   checkpoint_dir: "Débruitage/checkpoints"
   samples_dir:    "Débruitage/training_samples"
-  save_every_n_epochs: 10
+  save_every_n_epochs: 3
   log_every_n_epochs:  5
 
   mixed_precision: true
-  num_workers: 4
+  num_workers: 8
   pin_memory:  true
-  samples_per_epoch_multiplier: 128
+  samples_per_epoch_multiplier: 256
   recursive_video_scan: true
 
   # ── Alertes de surveillance ────────────────────────────────────────────
   oscillation_std_threshold: 0.010
   oscillation_min_epoch:     40
-  stagnation_patience:       15
+  stagnation_patience:       30
 
 sr:
   scale_factor:    2
