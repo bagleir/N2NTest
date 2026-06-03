@@ -2,6 +2,8 @@
 # Tous les chemins sont relatifs à la racine du projet (Stage/)
 # (résolus automatiquement par train.py et inference.py)
 
+# Lr = 2.8e-4 epochs 200 batch-size = 64
+
 data:
   # ── Sources vidéo ─────────────────────────────────────────────────────
   video_dirs:

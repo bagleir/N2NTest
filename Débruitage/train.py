@@ -103,7 +103,14 @@ def _pulsation_preservation_loss(
     target:    torch.Tensor,
     threshold: float,
 ) -> torch.Tensor:
-    """Pénalise si var(output) < threshold × var(target) — préserve la pulsation cardiaque."""
+    """Pénalise si var(output) < threshold × var(target) — préserve la pulsation cardiaque.
+
+    Requiert batch_size ≥ 2 pour que var(dim=0) soit définie.
+    Avec un seul sample (dernier batch d'une échelle si drop_last=False),
+    var() renverrait NaN → on retourne 0 plutôt que de corrompre la loss.
+    """
+    if output.shape[0] < 2:
+        return torch.zeros(1, device=output.device)[0]
     return torch.relu(threshold * target.var(dim=0).mean() - output.var(dim=0).mean())
 
 
@@ -451,8 +458,10 @@ def train(config_path: str, resume_path: str | None = None) -> None:
     )
 
     if ms_enabled:
-        train_sampler = MultiScaleBatchSampler(train_ds, batch_sizes_map, drop_last=False)
-        val_sampler   = MultiScaleBatchSampler(val_ds,   batch_sizes_map, drop_last=False)
+        # drop_last=True : évite les batches partiels (ex. 1 sample sur les 819 du 512×512)
+        # qui causent var(dim=0) indéfinie → NaN dans _pulsation_preservation_loss.
+        train_sampler = MultiScaleBatchSampler(train_ds, batch_sizes_map, drop_last=True)
+        val_sampler   = MultiScaleBatchSampler(val_ds,   batch_sizes_map, drop_last=True)
         train_dl = DataLoader(train_ds, batch_sampler=train_sampler, **_dl_kwargs)
         val_dl   = DataLoader(val_ds,   batch_sampler=val_sampler,   **_dl_kwargs)
         # Afficher la distribution prévue pour vérification au démarrage
@@ -483,7 +492,8 @@ def train(config_path: str, resume_path: str | None = None) -> None:
     )
     use_amp        = t_cfg["mixed_precision"] and device.type == "cuda"
     grad_clip      = float(t_cfg.get("grad_clip", 1.0))   # valeur par défaut / fallback
-    scaler         = GradScaler(enabled=use_amp)
+    # torch.cuda.amp.GradScaler est déprécié depuis PyTorch 2.x
+    scaler         = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     log.info("Modèle FastDVDnet : %.2fM paramètres", sum(p.numel() for p in model.parameters()) / 1e6)
     log.info("Mixed precision AMP : %s  |  grad_clip=%.1f", use_amp, grad_clip)
@@ -722,18 +732,26 @@ def train(config_path: str, resume_path: str | None = None) -> None:
             # ── Détail par échelle (multi-scale uniquement) ────────────────
             if ms_enabled and (scale_train_l or scale_val_l):
                 all_scales = sorted(set(list(scale_train_l) + list(scale_val_l)))
-                total_t    = max(len(train_l), 1)
+                # Calculer les % en SAMPLES (batches × batch_size),
+                # pas en batches — sinon le 512 paraît sur-représenté à cause
+                # de ses petits batches (batch_size=2 vs 32 pour le 128).
+                total_samples_t = sum(
+                    len(v) * batch_sizes_map.get(s, t_cfg.get("batch_size", 8))
+                    for s, v in scale_train_l.items()
+                )
+                total_samples_t = max(total_samples_t, 1)
                 tqdm.write("  Détail par échelle :")
                 for s in all_scales:
-                    tl_vals = scale_train_l.get(s, [])
-                    vl_vals = scale_val_l.get(s, [])
-                    ts_vals = scale_train_s.get(s, [])
-                    vs_vals = scale_val_s.get(s, [])
-                    pct     = len(tl_vals) / total_t * 100
-                    sl      = _safe_mean(tl_vals)
-                    ss      = _safe_mean(ts_vals)
-                    vl      = _safe_mean(vl_vals)
-                    vs      = _safe_mean(vs_vals)
+                    tl_vals  = scale_train_l.get(s, [])
+                    vl_vals  = scale_val_l.get(s, [])
+                    ts_vals  = scale_train_s.get(s, [])
+                    vs_vals  = scale_val_s.get(s, [])
+                    n_samp   = len(tl_vals) * batch_sizes_map.get(s, t_cfg.get("batch_size", 8))
+                    pct      = n_samp / total_samples_t * 100
+                    sl       = _safe_mean(tl_vals)
+                    ss       = _safe_mean(ts_vals)
+                    vl       = _safe_mean(vl_vals)
+                    vs       = _safe_mean(vs_vals)
                     tqdm.write(
                         f"    {s:3d}×{s:3d} ({pct:.0f}%) : "
                         f"Train L1={sl:.5f}  SSIM={ss:.4f} | "
