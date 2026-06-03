@@ -124,7 +124,7 @@ def estimate_noise_sigma(frames: list[np.ndarray], mask: np.ndarray) -> dict:
     coeff     = np.sqrt(np.pi / 2.0)
     sigmas    = []
     for frame in frames:
-        lap   = cv2.Laplacian(frame, cv2.CV_64F)
+        lap   = cv2.Laplacian(frame.astype(np.float64), cv2.CV_64F)
         roi   = lap[mask_bool]
         sigma = np.sqrt(np.mean(roi ** 2) / 6.0) * coeff
         sigmas.append(float(sigma))
@@ -276,7 +276,7 @@ def compute_noise_map(
                 tile = frame[ty:ty + tile_size, tx:tx + tile_size]
                 if tile.shape[0] < 3 or tile.shape[1] < 3:
                     continue
-                lap = cv2.Laplacian(tile, cv2.CV_64F)
+                lap = cv2.Laplacian(tile.astype(np.float64), cv2.CV_64F)
                 roi = lap[tile_m]
                 if len(roi) < 4:
                     continue
