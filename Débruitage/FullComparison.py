@@ -4,34 +4,36 @@ Pipeline de comparaison complète sur une frame de référence.
 
 Entrée : vidéo de base (non prétraitée).
 
-Génère automatiquement les 9 cas suivants (tous avec masque) :
-  1. Base avant prétraitement                       → frame FRAME
-  2. Après prétraitement                            → frame FRAME
-  3. Après prétraitement + USM                      → frame FRAME
-  4. Après prétraitement → projection (image temporelle)
-  5. Après prétraitement + USM → projection
-  6. Après N2N (sur prétraité 1024×1024) → projection
-  7. Après N2N (sur USM 1024×1024)       → projection
-  8. Prétraitement → Drizzle SR → USM    → projection SR
-  9. Prétraitement → N2N (512) → Drizzle SR → USM → projection SR  [nécessite checkpoint]
+Cas générés (tous avec masque) :
+  1. Base avant prétraitement                → frame FRAME
+  2. Après prétraitement                     → frame FRAME
+  3. Après prétraitement + USM               → frame FRAME
+  4. Prétraitement → upscale → projection
+  5. Upscale + USM → projection
+  6. N2N (sur upscalé 1024×1024) → projection              [checkpoint requis]
+  7. N2N (sur USM upscalé 1024×1024) → projection          [checkpoint requis]
+     └─ USM appliqué AVANT N2N dans le cas 7.
+ 10. N2N (512) → USM → upscale → projection                [checkpoint requis]
+ 11. N2N (512) → CLAHE + USM → upscale → projection        [checkpoint requis]
+     └─ Cas 10/11 : N2N sur la vidéo prétraitée 512, post-traitement en 512,
+        puis upscale 1024 et projection. Ordre inverse du cas 7 (post-traitement
+        APRÈS le débruitage).
 
 Pour chaque cas : image complète + zoom 128×128 centré.
-Les projections (cas 4-7) sont upscalées à 1024×1024 (Lanczos).
-Les cas 8-9 utilisent Drizzle pour la super-résolution temporelle (512→1024).
+Les projections sont à 1024×1024 (upscale Lanczos).
 
-Vidéos sauvegardées dans output_dir/videos/ :
-  01_base_masked.avi   02_preprocessed.avi   03_usm.avi
+Deux grilles de comparaison produites :
+  comparison_grid_pipeline.png  — cas 1, 4, 5
+  comparison_grid_n2n.png       — cas 2, 5, 7, 6, 10, 11
 
 Usage :
   python FullComparison.py video_base.avi
   python FullComparison.py video_base.avi --output-dir resultats/ --frame 50
   python FullComparison.py video_base.avi --checkpoint checkpoints/best.pth
-  python FullComparison.py video_base.avi --drop-size 0.5
 """
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import subprocess
 import sys
@@ -40,7 +42,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from skimage.filters import unsharp_mask as ski_usm
 
 import matplotlib
 matplotlib.use("Agg")
@@ -52,7 +53,7 @@ from Pretraitement import preprocess_video
 from ApplyUSM import apply_usm_video
 from ApplyMask import apply_mask_video
 from TemporalProjection import compute_projections
-from DrizzleSR import temporal_sr_drizzle
+from CLAHE import apply_clahe_usm_pipeline
 
 PROJ_KEY    = "mean"   # clé de projection utilisée : 'mean' | 'percentile_90' | etc.
 CROP_SIZE   = 128
@@ -158,7 +159,6 @@ def _run_n2n(
 
     Cas 6/7 reçoivent mask_1024.png (1024×1024) car les vidéos sont upscalées ;
     sans ça numpy lève une erreur de forme dans np.where(mask > 0, ...).
-    Cas 9 reçoit le masque 512×512 original.
     """
     print(f"  Lancement N2N : {video_in.name} → {video_out.name}")
     print(f"  Masque         : {mask_path}")
@@ -175,33 +175,6 @@ def _run_n2n(
     return True
 
 
-def _apply_usm_image(img: np.ndarray, sigma: float, strength: float) -> np.ndarray:
-    """Applique USM sur une seule image (uint8 H×W)."""
-    sharpened = ski_usm(img, radius=sigma, amount=strength, preserve_range=True)
-    return np.clip(sharpened, 0, 255).astype(np.uint8)
-
-
-def _load_corrupted_frames(search_dirs: list[Path]) -> list[int]:
-    """
-    Charge la liste des frames corrompues depuis step2_corrected.json.
-
-    Gère deux formats de fichier :
-      • {"corrupted_frames": [0, 5, ...]}   — format explicite
-      • {"0": {...}, "5": {...}}             — format Pretraitement (clés = indices)
-    """
-    for d in search_dirs:
-        p = Path(d) / "step2_corrected.json"
-        if p.exists():
-            with open(p) as f:
-                data = json.load(f)
-            if "corrupted_frames" in data:
-                frames = [int(x) for x in data["corrupted_frames"]]
-            else:
-                # Clés = indices de frames sous forme de strings
-                frames = [int(k) for k in data.keys() if k.isdigit()]
-            print(f"  Frames corrompues : {len(frames)} (depuis {p.name})")
-            return frames
-    return []
 
 
 def _comparison_grid(
@@ -257,7 +230,6 @@ def run_comparison(
     sigma:      float = 2.0,
     strength:   float = 2.0,
     crop_size:  int   = CROP_SIZE,
-    drop_size:  float = 0.7,
     mask_path:  str | None = None,
 ) -> None:
     t0   = time.perf_counter()
@@ -392,55 +364,6 @@ def run_comparison(
                            f"projection_{PROJ_KEY}", crop_size)
     case_data[5] = (f"5. USM\n+ Projection", img, crop)
 
-    # ── Pré-calcul Drizzle SR (cas 8, indépendant du checkpoint N2N) ─────────
-    # Inséré dans `cases` après les cas N2N pour respecter l'ordre 1-9.
-    # Encapsulé dans try/except : si Drizzle SR échoue (RuntimeError trop peu de
-    # frames valides, etc.), on bascule sur Lanczos SR.  L'exception ne bloque
-    # plus les cas 6 et 7.
-    _step("Cas 8 — Drizzle SR (prétraité 512→1024) → USM")
-    _c8_img:   np.ndarray | None = None
-    _c8_label: str               = "8. Drizzle SR\n→ USM"
-    p_drizzle_sr     = vdir / "08_drizzle_sr"
-    p_drizzle_sr_usm = vdir / "08_drizzle_sr_usm.png"
-
-    if p_drizzle_sr_usm.exists():
-        print(f"  Cache trouvé : {p_drizzle_sr_usm.name}")
-        _c8_img = cv2.imread(str(p_drizzle_sr_usm), cv2.IMREAD_GRAYSCALE)
-    else:
-        corrupted8 = _load_corrupted_frames([preproc_work, vdir, base.parent])
-        try:
-            sr8     = temporal_sr_drizzle(
-                video_path      = p_preproc,
-                mask            = mask,
-                corrupted_frames= corrupted8,
-                output_path     = p_drizzle_sr,
-                drop_size       = drop_size,
-            )
-            _c8_img = _apply_usm_image(sr8["sr_image"], sigma=sigma, strength=strength)
-            _c8_img[~mask_bool_up] = 0
-            cv2.imwrite(str(p_drizzle_sr_usm), _c8_img)
-        except Exception as exc8:
-            # Drizzle SR peut échouer si trop peu de frames ont des décalages
-            # sous-pixeliques suffisamment diversifiés.  On bascule sur Lanczos.
-            print(f"\n  ⚠ Drizzle SR échoué ({exc8})")
-            print("  → Fallback : Lanczos SR (upscale × 2 depuis la médiane temporelle)")
-            try:
-                from DrizzleSR import lanczos_sr
-                _c8_lan = lanczos_sr(
-                    video_path       = p_preproc,
-                    mask             = mask,
-                    corrupted_frames = corrupted8,
-                    output_path      = vdir / "08_lanczos_sr",
-                    scale_factor     = 2,
-                )
-                _c8_img   = _apply_usm_image(_c8_lan, sigma=sigma, strength=strength)
-                _c8_img[~mask_bool_up] = 0
-                cv2.imwrite(str(p_drizzle_sr_usm), _c8_img)
-                _c8_label = "8. Lanczos SR\n→ USM (fallback)"
-                print("  → Lanczos SR OK")
-            except Exception as exc8b:
-                print(f"\n  ⚠ Lanczos SR également échoué ({exc8b}) — cas 8 ignoré")
-
     # ── Détection du checkpoint N2N ───────────────────────────────────────────
     # Ordre de priorité :
     #   1. checkpoint passé explicitement via --checkpoint
@@ -512,58 +435,77 @@ def run_comparison(
                                    f"projection_{PROJ_KEY}", crop_size)
             case_data[7] = ("7. N2N (USM upscalé)\n+ Projection", img, crop)
 
-        # ── Cas 9 : N2N 512×512 → Drizzle SR → USM ───────────────────────────
-        # mask_png = masque 512×512 original (vidéo prétraitée non upscalée)
-        _step("Cas 9 — N2N (prétraité 512×512) → Drizzle SR → USM")
-        p_n2n_512            = vdir / "09_n2n_preproc_512.avi"
-        p_drizzle_n2n_sr_usm = vdir / "09_drizzle_n2n_sr_usm.png"
-        ok = True
-        if not p_n2n_512.exists():
-            ok = _run_n2n(p_preproc, p_n2n_512, ckpt, sdir, mask_path=mask_png)
+        # ── Cas 10 & 11 : N2N 512 → post-traitement → upscale → projection ────
+        # Les deux cas partagent le même résultat N2N sur la vidéo prétraitée 512.
+        _step("Cas 10 & 11 — N2N (prétraité 512) → USM / CLAHE+USM → upscale → projection")
+        p_n2n_512_shared = vdir / "10_11_n2n_preproc_512.avi"
+        ok_n2n512 = True
+        if not p_n2n_512_shared.exists():
+            ok_n2n512 = _run_n2n(p_preproc, p_n2n_512_shared, ckpt, sdir, mask_path=mask_png)
         else:
-            print(f"  Cache trouvé : {p_n2n_512.name}")
-        if ok and p_n2n_512.exists():
-            if p_drizzle_n2n_sr_usm.exists():
-                print(f"  Cache trouvé : {p_drizzle_n2n_sr_usm.name}")
-                _c9_img = cv2.imread(str(p_drizzle_n2n_sr_usm), cv2.IMREAD_GRAYSCALE)
+            print(f"  Cache trouvé : {p_n2n_512_shared.name}")
+
+        if ok_n2n512 and p_n2n_512_shared.exists():
+            # ── Cas 10 : N2N → USM → upscale → projection ────────────────────
+            p_n2n_usm_512  = vdir / "10_n2n_usm_512.avi"
+            p_n2n_usm_1024 = vdir / "10_n2n_usm_1024.avi"
+            if not p_n2n_usm_512.exists():
+                print(f"  Cas 10 : application USM sur {p_n2n_512_shared.name}…")
+                apply_usm_video(
+                    str(p_n2n_512_shared), str(p_n2n_usm_512),
+                    sigma=sigma, strength=strength,
+                )
             else:
-                corrupted9 = _load_corrupted_frames([preproc_work, vdir, base.parent])
-                try:
-                    sr9     = temporal_sr_drizzle(
-                        video_path      = p_n2n_512,
-                        mask            = mask,
-                        corrupted_frames= corrupted9,
-                        output_path     = vdir / "09_drizzle_n2n_sr",
-                        drop_size       = drop_size,
-                    )
-                    _c9_img = _apply_usm_image(sr9["sr_image"], sigma=sigma, strength=strength)
-                    _c9_img[~mask_bool_up] = 0
-                    cv2.imwrite(str(p_drizzle_n2n_sr_usm), _c9_img)
-                except Exception as exc9:
-                    print(f"\n  ⚠ Drizzle SR (cas 9) échoué ({exc9}) — cas 9 ignoré")
+                print(f"  Cache trouvé : {p_n2n_usm_512.name}")
+            if not p_n2n_usm_1024.exists():
+                _upscale_video(str(p_n2n_usm_512), str(p_n2n_usm_1024), size=PROJ_SIZE)
+            else:
+                print(f"  Cache trouvé : {p_n2n_usm_1024.name}")
+            projs10 = compute_projections(
+                str(p_n2n_usm_1024), mask_up, str(out / "cas_10_n2n_usm")
+            )
+            img, crop = _save_case(
+                projs10[PROJ_KEY], out / "cas_10_n2n_usm",
+                f"projection_{PROJ_KEY}", crop_size,
+            )
+            case_data[10] = ("10. N2N → USM\n→ Projection", img, crop)
 
-    # ── Cas 8 → inséré après les cas N2N pour respecter l'ordre 1-9 ──────────
-    if _c8_img is not None:
-        img, crop = _save_case(_c8_img, out / "cas_08_drizzle_sr_usm", "projection", crop_size)
-        case_data[8] = (_c8_label, img, crop)
-    else:
-        print("  Cas 8 ignoré (Drizzle SR et Lanczos SR ont tous deux échoué)")
-
-    # ── Cas 9 → inséré en dernier si disponible ───────────────────────────────
-    if _c9_img is not None:
-        img, crop = _save_case(_c9_img, out / "cas_09_drizzle_n2n_usm", "projection", crop_size)
-        case_data[9] = ("9. N2N → Drizzle SR\n→ USM", img, crop)
+            # ── Cas 11 : N2N → CLAHE+USM → upscale → projection ──────────────
+            # apply_clahe_usm_pipeline enchaîne CLAHE puis USM en une seule passe.
+            p_n2n_clahe_usm_512  = vdir / "11_n2n_clahe_usm_512.avi"
+            p_n2n_clahe_usm_1024 = vdir / "11_n2n_clahe_usm_1024.avi"
+            if not p_n2n_clahe_usm_512.exists():
+                print(f"  Cas 11 : application CLAHE+USM sur {p_n2n_512_shared.name}…")
+                apply_clahe_usm_pipeline(
+                    video_path  = str(p_n2n_512_shared),
+                    mask        = mask,
+                    output_path = str(p_n2n_clahe_usm_512),
+                )
+            else:
+                print(f"  Cache trouvé : {p_n2n_clahe_usm_512.name}")
+            if not p_n2n_clahe_usm_1024.exists():
+                _upscale_video(str(p_n2n_clahe_usm_512), str(p_n2n_clahe_usm_1024), size=PROJ_SIZE)
+            else:
+                print(f"  Cache trouvé : {p_n2n_clahe_usm_1024.name}")
+            projs11 = compute_projections(
+                str(p_n2n_clahe_usm_1024), mask_up, str(out / "cas_11_n2n_clahe_usm")
+            )
+            img, crop = _save_case(
+                projs11[PROJ_KEY], out / "cas_11_n2n_clahe_usm",
+                f"projection_{PROJ_KEY}", crop_size,
+            )
+            case_data[11] = ("11. N2N → CLAHE+USM\n→ Projection", img, crop)
 
     # ── Deux grilles de comparaison ───────────────────────────────────────────
     #
-    #   Grille 1 — Pipeline SR / projection  (sans N2N appliqué directement)
-    #     1 Base | 4 Projection | 5 USM+Proj | 8 Drizzle SR | 9 N2N→Drizzle SR
+    #   Grille pipeline  — vision globale sans N2N direct
+    #     1 Base | 4 Projection | 5 USM+Proj
     #
-    #   Grille 2 — Impact du débruitage N2N
-    #     1 Base | 5 USM+Proj | 6 N2N upscalé | 7 N2N USM | 9 N2N→Drizzle SR
+    #   Grille N2N — comparaison des stratégies de débruitage (ordre utilisateur)
+    #     2 Prétraité | 5 USM+Proj | 7 N2N(USM avant) | 6 N2N(upscalé)
+    #     | 10 N2N→USM | 11 N2N→CLAHE+USM
     #
-    # Les cas absents (checkpoint manquant, Drizzle SR échoué) sont simplement
-    # omis — la grille se rétrécit en conséquence.
+    # Les cas absents (checkpoint manquant) sont simplement omis.
 
     def _make_grid(numbers: list[int], output_path: Path, title: str) -> None:
         selected = [case_data[n] for n in numbers if n in case_data]
@@ -573,14 +515,14 @@ def run_comparison(
             print(f"  Aucun cas disponible pour la grille '{title}' — ignorée")
 
     _make_grid(
-        [1, 4, 5, 8, 9],
-        out / "comparison_grid_sr.png",
-        "Grille 1 — Pipeline SR / Projection  (1 Base | 4 Proj | 5 USM+Proj | 8 Drizzle SR | 9 N2N→SR)",
+        [1, 4, 5],
+        out / "comparison_grid_pipeline.png",
+        "Pipeline — 1 Base  |  4 Projection  |  5 USM + Projection",
     )
     _make_grid(
-        [1, 5, 6, 7, 9],
+        [2, 5, 7, 6, 10, 11],
         out / "comparison_grid_n2n.png",
-        "Grille 2 — Impact du débruitage N2N  (1 Base | 5 USM+Proj | 6 N2N upsc | 7 N2N USM | 9 N2N→SR)",
+        "N2N — 2 Prétraité  |  5 USM+Proj  |  7 N2N(USM→)  |  6 N2N(upsc)  |  10 N2N→USM  |  11 N2N→CLAHE+USM",
     )
 
     elapsed = time.perf_counter() - t0
@@ -614,9 +556,6 @@ def main() -> None:
         help="Intensité USM (défaut : 2.0).")
     parser.add_argument("--crop-size",  type=int, default=CROP_SIZE,
         help=f"Taille du zoom central en pixels (défaut : {CROP_SIZE}).")
-    parser.add_argument("--drop-size",  type=float, default=0.7,
-        help="Taille du noyau Drizzle en pixels HR (défaut : 0.7). "
-             "0.5=net, 0.7=équilibré, 1.0=moyenne.")
     parser.add_argument("--mask", default=None,
         help="Masque binaire PNG à utiliser directement (défaut : auto-généré par le prétraitement).")
     args = parser.parse_args()
@@ -635,7 +574,6 @@ def main() -> None:
     print(f"  Sortie      : {out_dir}")
     print(f"  Frame       : {args.frame}")
     print(f"  USM         : sigma={args.sigma}  strength={args.strength}")
-    print(f"  Drizzle     : drop_size={args.drop_size}")
     print(f"  Checkpoint  : {args.checkpoint or 'auto-detect'}")
     print(f"  Masque      : {args.mask or 'auto-généré'}")
 
@@ -647,7 +585,6 @@ def main() -> None:
         sigma      = args.sigma,
         strength   = args.strength,
         crop_size  = args.crop_size,
-        drop_size  = args.drop_size,
         mask_path  = args.mask,
     )
 

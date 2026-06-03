@@ -38,7 +38,7 @@ USM_STRENGTH          = 0.5        # unsharp mask blending weight
 # Mask cleanup parameters
 MASK_EROSION_PX       = 4          # pixels to erode mask before CLAHE (avoids border artefacts)
 BORDER_SMOOTH_PX      = 10         # width of the border blending zone (px from mask edge)
-BORDER_SMOOTH_SIGMA   = 0.5        # Gaussian sigma for border smoothing
+BORDER_SMOOTH_SIGMA   = 3.0        # Gaussian sigma for border smoothing (proportional to BORDER_SMOOTH_PX)
 
 FPS                     = 30.0     # acquisition frame rate (used for FFT axis)
 CARDIAC_FREQ_MIN        = 0.5      # Hz — lower bound of cardiac band
@@ -178,11 +178,17 @@ def apply_clahe(
     Pixels outside the original mask remain 0. Input must be uint8.
     Retourne la frame rehaussée uint8.
     """
-    clahe        = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-    eroded_mask  = _erode_mask(mask, erosion_px)
-    enhanced     = clahe.apply(frame)
-    out          = np.zeros_like(frame)
-    out[eroded_mask.astype(bool)] = enhanced[eroded_mask.astype(bool)]
+    clahe       = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    eroded_mask = _erode_mask(mask, erosion_px)
+    eroded_bool = eroded_mask.astype(bool)
+    # Fill non-mask area with the mean of masked pixels so the CLAHE tile
+    # histograms are not dominated by the black background (0-bias fix).
+    fill_val    = int(frame[eroded_bool].mean()) if eroded_bool.any() else 128
+    filled      = frame.copy()
+    filled[~eroded_bool] = fill_val
+    enhanced    = clahe.apply(filled)
+    out         = np.zeros_like(frame)
+    out[eroded_bool] = enhanced[eroded_bool]
     return out
 
 
@@ -244,10 +250,14 @@ def apply_clahe_usm_pipeline(
           'mean_contrast_after'  : float
           'processing_time_ms'   : float
     """
-    print("  Loading video …", end=" ", flush=True)
-    frames, fps = _read_video_gray(video_path)
-    N, H, W = frames.shape
-    print(f"{N} frames @ {fps:.1f} fps  ({H}×{W})")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or FPS
+    N   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"  Loading video …  {N} frames @ {fps:.1f} fps  ({H}×{W})")
 
     clahe = cv2.createCLAHE(
         clipLimit=clahe_clip_limit,
@@ -255,23 +265,39 @@ def apply_clahe_usm_pipeline(
     )
     ksize = usm_kernel_size if usm_kernel_size % 2 == 1 else usm_kernel_size + 1
 
-    # Pré-calcul du masque érodé (Étape A) — commun à toutes les frames
-    eroded_mask  = _erode_mask(mask, mask_erosion_px)
-    eroded_bool  = eroded_mask.astype(bool)
+    eroded_mask   = _erode_mask(mask, mask_erosion_px)
+    eroded_bool   = eroded_mask.astype(bool)
     original_bool = mask.astype(bool)
 
-    sample_idx = np.linspace(0, N - 1, min(20, N), dtype=int)
-    contrast_before = float(np.mean([_local_contrast(frames[i], mask) for i in sample_idx]))
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (W, H), isColor=False)
 
-    output_frames = np.empty_like(frames)
+    # Sample every ~5% of frames for contrast metrics
+    sample_interval = max(1, N // 20)
+    contrast_before_samples: list[float] = []
+    contrast_after_samples:  list[float] = []
     frame_times: list[float] = []
+    i = 0
 
-    for i in range(N):
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame.ndim == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if i % sample_interval == 0:
+            contrast_before_samples.append(_local_contrast(frame, mask))
+
         t0 = time.perf_counter()
 
-        # Étape A — CLAHE sur le masque érodé uniquement
-        enhanced    = clahe.apply(frames[i])
-        after_clahe = np.zeros_like(frames[i])
+        # Étape A — CLAHE sur le masque érodé (histogramme non biaisé par le fond noir)
+        fill_val    = int(frame[eroded_bool].mean()) if eroded_bool.any() else 128
+        filled      = frame.copy()
+        filled[~eroded_bool] = fill_val
+        enhanced    = clahe.apply(filled)
+        after_clahe = np.zeros_like(frame)
         after_clahe[eroded_bool] = enhanced[eroded_bool]
 
         # USM — renforcement des bords (sur le masque érodé)
@@ -283,18 +309,24 @@ def apply_clahe_usm_pipeline(
         after_usm[~original_bool] = 0
 
         # Étape C — Lissage gaussien uniquement sur la bande de bord
-        output_frames[i] = _smooth_mask_border(
+        out_frame = _smooth_mask_border(
             after_usm, mask, border_smooth_px, border_smooth_sigma
         )
 
         frame_times.append((time.perf_counter() - t0) * 1_000.0)
 
-    contrast_after = float(
-        np.mean([_local_contrast(output_frames[i], mask) for i in sample_idx])
-    )
-    avg_ms = float(np.mean(frame_times))
+        if i % sample_interval == 0:
+            contrast_after_samples.append(_local_contrast(out_frame, mask))
 
-    _write_video(output_frames, output_path, fps)
+        writer.write(out_frame)
+        i += 1
+
+    cap.release()
+    writer.release()
+
+    contrast_before = float(np.mean(contrast_before_samples)) if contrast_before_samples else 0.0
+    contrast_after  = float(np.mean(contrast_after_samples))  if contrast_after_samples  else 0.0
+    avg_ms          = float(np.mean(frame_times))              if frame_times             else 0.0
 
     print(f"\n  ── CLAHE + Unsharp Mask (avec nettoyage de bord) ───────────")
     print(f"  clipLimit            : {clahe_clip_limit}")
@@ -305,7 +337,8 @@ def apply_clahe_usm_pipeline(
     print(f"  Temps moyen/frame    : {avg_ms:.2f} ms  {'[OK]' if avg_ms < 3.0 else '[LENT — > 3 ms]'}")
     print(f"  Contraste local avant: {contrast_before:.3f}")
     print(f"  Contraste local après: {contrast_after:.3f}")
-    print(f"  Gain contraste       : {contrast_after / contrast_before:.2f}×")
+    if contrast_before > 0:
+        print(f"  Gain contraste       : {contrast_after / contrast_before:.2f}×")
     print(f"  Sortie               : {output_path}")
 
     return {
@@ -371,10 +404,13 @@ def calibration_grid(
             fontsize=7, rotation=0, ha="right", va="center", labelpad=60,
         )
 
-        # Pré-calcul CLAHE (Étape A : masque érodé)
-        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tile)
+        # Pré-calcul CLAHE (Étape A : masque érodé, histogramme non biaisé)
+        clahe       = cv2.createCLAHE(clipLimit=clip, tileGridSize=tile)
+        fill_val    = int(mid[eroded_bool].mean()) if eroded_bool.any() else 128
+        mid_filled  = mid.copy()
+        mid_filled[~eroded_bool] = fill_val
         after_clahe = np.zeros_like(mid)
-        after_clahe[eroded_bool] = clahe.apply(mid)[eroded_bool]
+        after_clahe[eroded_bool] = clahe.apply(mid_filled)[eroded_bool]
         f32 = after_clahe.astype(np.float32)
 
         for col_idx, strength in enumerate(USM_STRENGTHS):
@@ -495,7 +531,7 @@ def compare_full_pipeline(
 
     plt.suptitle(
         f"Comparaison pipeline complet — {n_samples} frames échantillons\n"
-        f"Lignes paires : frame 512×512  |  Lignes impaires : crop {crop_size}×{crop_size} px"
+        f"Lignes paires : frame complète  |  Lignes impaires : crop {crop_size}×{crop_size} px"
         f"  (zone vasculaire — gain le plus visible)",
         fontsize=10,
     )
@@ -599,6 +635,90 @@ def verify_pulsation_preserved(
     return {"cardiac_amplitude_ratio": ratio, "dominant_freq_hz": dom_freq}
 
 
+# ── CLI helpers ───────────────────────────────────────────────────────────────
+
+_VIDEO_EXTENSIONS = {".avi", ".mp4", ".mkv", ".mov", ".mpeg", ".mpg"}
+
+
+def _resolve_mask(mask_arg: str | None, video_path: Path, fallback_dir: Path | None = None) -> np.ndarray:
+    """Return a loaded mask array.
+
+    Priority: --mask argument > mask.png next to video > mask.png in fallback_dir.
+    """
+    if mask_arg:
+        p = Path(mask_arg)
+        if not p.exists():
+            sys.exit(f"ERREUR : masque introuvable : {p}")
+        return load_mask(str(p))
+    candidates = [video_path.parent / "mask.png"]
+    if fallback_dir:
+        candidates.append(fallback_dir / "mask.png")
+    for p in candidates:
+        if p.exists():
+            return load_mask(str(p))
+    sys.exit(
+        f"ERREUR : masque introuvable. Fournissez --mask <chemin> "
+        f"ou placez mask.png dans {video_path.parent}"
+    )
+
+
+def _run_single(video_in: Path, mask: np.ndarray, out_dir: Path, args) -> None:
+    """Process one video and save outputs to out_dir."""
+    tile_size = (args.tile, args.tile)
+    stem      = video_in.stem
+
+    if args.calibrate:
+        out_calib = out_dir / f"{stem}_calibration_grid.png"
+        print(f"\n  Mode calibration — grille → {out_calib}\n")
+        calibration_grid(str(video_in), mask, str(out_calib))
+        print(
+            "\n  ── Comment utiliser la grille ──────────────────────────────\n"
+            "  1. Ouvrir la grille à 100% dans un viewer.\n"
+            "  2. Chercher la vignette où les petits vaisseaux sont nets,\n"
+            "     sans halos et sans bruit amplifié dans le fond noir.\n"
+            "  3. Lire les paramètres annotés (clip, tile, usm_strength).\n"
+            "  4. Relancer sans --calibrate avec ces valeurs :\n"
+            "     python CLAHE.py <input> --clip-limit X --tile Y --usm-strength Z"
+        )
+        return
+
+    out_video = out_dir / f"{stem}_clahe_usm.avi"
+    out_puls  = out_dir / f"{stem}_pulsation.png"
+
+    print(f"    Sortie  : {out_video}")
+    print(f"    clip={args.clip_limit}  tile={tile_size}  "
+          f"usm_kernel={args.usm_kernel}  usm_strength={args.usm_strength}\n")
+
+    apply_clahe_usm_pipeline(
+        video_path           = str(video_in),
+        mask                 = mask,
+        output_path          = str(out_video),
+        clahe_clip_limit     = args.clip_limit,
+        clahe_tile_grid_size = tile_size,
+        usm_kernel_size      = args.usm_kernel,
+        usm_strength         = args.usm_strength,
+    )
+
+    verify_pulsation_preserved(
+        video_temporal_median = str(video_in),
+        video_final           = str(out_video),
+        mask                  = mask,
+        output_path           = str(out_puls),
+    )
+
+    if getattr(args, "original", None) and getattr(args, "preprocessed", None):
+        out_compare = out_dir / f"{stem}_pipeline_comparison.png"
+        compare_full_pipeline(
+            video_brute           = args.original,
+            video_preprocessed    = args.preprocessed,
+            video_temporal_median = str(video_in),
+            video_final           = str(out_video),
+            mask                  = mask,
+            output_path           = str(out_compare),
+            crop_origin           = (args.crop_y, args.crop_x),
+        )
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 
@@ -608,18 +728,37 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Step [9] — CLAHE + Unsharp Mask post-processing.\n\n"
+            "Modes :\n"
+            "  Vidéo unique  : python CLAHE.py <vidéo_ou_dossier_pipeline>\n"
+            "  Dossier entier: python CLAHE.py <dossier_videos> --batch\n\n"
             "Workflow recommandé :\n"
-            "  1. python CLAHE.py <dossier> --calibrate\n"
-            "  2. Ouvrir step9_calibration_grid.png, choisir les meilleurs paramètres\n"
-            "  3. python CLAHE.py <dossier> --clip-limit X --tile Y --usm-strength Z"
+            "  1. python CLAHE.py <input> --calibrate\n"
+            "  2. Ouvrir la grille de calibration, choisir les paramètres\n"
+            "  3. python CLAHE.py <input> --clip-limit X --tile Y --usm-strength Z"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "input",
         help=(
-            "Répertoire contenant step7_temporal_median.avi + mask.png, "
-            "ou chemin direct vers la vidéo à traiter."
+            "Vidéo, dossier pipeline (contenant step7_temporal_median.avi + mask.png), "
+            "ou dossier de vidéos (avec --batch)."
+        ),
+    )
+    parser.add_argument(
+        "--mask", default=None, metavar="PATH",
+        help="Chemin vers le masque (défaut : mask.png dans le même dossier que la vidéo)",
+    )
+    parser.add_argument(
+        "--output", default=None, metavar="DIR",
+        help="Dossier de sortie (défaut : même dossier que la vidéo entrante)",
+    )
+    parser.add_argument(
+        "--batch", action="store_true",
+        help=(
+            "Traiter toutes les vidéos du dossier input. "
+            "Un masque commun peut être fourni via --mask ; "
+            "sinon mask.png est cherché dans chaque sous-dossier puis dans input."
         ),
     )
     parser.add_argument(
@@ -644,11 +783,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--original", default=None,
-        help="Vidéo brute originale (pour compare_full_pipeline)",
+        help="Vidéo brute originale (pour compare_full_pipeline, mode vidéo unique)",
     )
     parser.add_argument(
         "--preprocessed", default=None,
-        help="Vidéo après prétraitement étapes 1-6 (pour compare_full_pipeline)",
+        help="Vidéo après prétraitement étapes 1-6 (pour compare_full_pipeline, mode vidéo unique)",
     )
     parser.add_argument(
         "--crop-y", type=int, default=180,
@@ -660,75 +799,59 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    inp = Path(args.input)
+    inp     = Path(args.input)
+    out_dir = Path(args.output) if args.output else None
 
-    if inp.is_dir():
-        video_in  = inp / "step7_temporal_median.avi"
-        mask_path = inp / "mask.png"
-        out_dir   = inp
+    # ── Mode batch : traiter toutes les vidéos d'un dossier ──────────────────
+    if args.batch:
+        if not inp.is_dir():
+            sys.exit("ERREUR : --batch requiert un dossier en entrée")
+
+        videos = sorted(f for f in inp.iterdir() if f.suffix.lower() in _VIDEO_EXTENSIONS)
+        if not videos:
+            sys.exit(f"ERREUR : aucune vidéo ({', '.join(_VIDEO_EXTENSIONS)}) trouvée dans {inp}")
+
+        batch_out = out_dir or inp
+        batch_out.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n[9] CLAHE + USM — batch : {len(videos)} vidéo(s) dans {inp}")
+        print(f"    Sortie   : {batch_out}")
+        if args.mask:
+            print(f"    Masque   : {args.mask} (commun)")
+
+        skipped = 0
+        for video_in in videos:
+            print(f"\n  ── {video_in.name} " + "─" * max(0, 50 - len(video_in.name)))
+            try:
+                mask = _resolve_mask(args.mask, video_in, fallback_dir=inp)
+            except SystemExit as e:
+                print(f"  IGNORÉ : {e}")
+                skipped += 1
+                continue
+
+            print(f"    Entrée : {video_in}")
+            _run_single(video_in, mask, batch_out, args)
+
+        print(f"\n[9] Batch terminé — {len(videos) - skipped}/{len(videos)} vidéo(s) traitée(s) → {batch_out}")
+
+    # ── Mode vidéo unique ─────────────────────────────────────────────────────
     else:
-        video_in  = inp
-        mask_path = inp.parent / "mask.png"
-        out_dir   = inp.parent
+        if inp.is_dir():
+            video_in       = inp / "step7_temporal_median.avi"
+            default_out    = out_dir or inp
+        else:
+            video_in       = inp
+            default_out    = out_dir or inp.parent
 
-    if not video_in.exists():
-        sys.exit(f"ERREUR : vidéo introuvable : {video_in}")
-    if not mask_path.exists():
-        sys.exit(f"ERREUR : masque introuvable : {mask_path}")
+        if not video_in.exists():
+            sys.exit(f"ERREUR : vidéo introuvable : {video_in}")
 
-    mask = load_mask(str(mask_path))
-    tile_size = (args.tile, args.tile)
+        default_out.mkdir(parents=True, exist_ok=True)
+        mask = _resolve_mask(args.mask, video_in)
 
-    print(f"\n[9] CLAHE + Unsharp Mask")
-    print(f"    Entrée  : {video_in}")
-    print(f"    Masque  : {mask_path}")
+        print(f"\n[9] CLAHE + Unsharp Mask")
+        print(f"    Entrée  : {video_in}")
+        print(f"    Masque  : {args.mask or (video_in.parent / 'mask.png')}")
+        print(f"    Sortie  : {default_out}")
 
-    if args.calibrate:
-        out_calib = out_dir / "step9_calibration_grid.png"
-        print(f"\n  Mode calibration — grille → {out_calib}\n")
-        calibration_grid(str(video_in), mask, str(out_calib))
-        print(
-            "\n  ── Comment utiliser la grille ──────────────────────────────\n"
-            "  1. Ouvrir step9_calibration_grid.png à 100% dans un viewer.\n"
-            "  2. Chercher la vignette où les petits vaisseaux sont nets,\n"
-            "     sans halos et sans bruit amplifié dans le fond noir.\n"
-            "  3. Lire les paramètres annotés (clip, tile, usm_strength).\n"
-            "  4. Relancer sans --calibrate avec ces valeurs :\n"
-            "     python CLAHE.py <input> --clip-limit X --tile Y --usm-strength Z"
-        )
-    else:
-        out_video = out_dir / "step9_clahe_usm.avi"
-        out_puls  = out_dir / "step9_pulsation.png"
-
-        print(f"    Sortie  : {out_video}")
-        print(f"    clip={args.clip_limit}  tile={tile_size}  "
-              f"usm_kernel={args.usm_kernel}  usm_strength={args.usm_strength}\n")
-
-        stats = apply_clahe_usm_pipeline(
-            video_path           = str(video_in),
-            mask                 = mask,
-            output_path          = str(out_video),
-            clahe_clip_limit     = args.clip_limit,
-            clahe_tile_grid_size = tile_size,
-            usm_kernel_size      = args.usm_kernel,
-            usm_strength         = args.usm_strength,
-        )
-
-        verify_pulsation_preserved(
-            video_temporal_median = str(video_in),
-            video_final           = str(out_video),
-            mask                  = mask,
-            output_path           = str(out_puls),
-        )
-
-        if args.original and args.preprocessed:
-            out_compare = out_dir / "step9_pipeline_comparison.png"
-            compare_full_pipeline(
-                video_brute           = args.original,
-                video_preprocessed    = args.preprocessed,
-                video_temporal_median = str(video_in),
-                video_final           = str(out_video),
-                mask                  = mask,
-                output_path           = str(out_compare),
-                crop_origin           = (args.crop_y, args.crop_x),
-            )
+        _run_single(video_in, mask, default_out, args)
