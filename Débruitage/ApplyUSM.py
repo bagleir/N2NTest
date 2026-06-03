@@ -64,17 +64,51 @@ def apply_usm_video(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Applique USM sur toutes les frames d'une vidéo.")
-    parser.add_argument("input", help="Vidéo d'entrée (.avi).")
-    parser.add_argument("--output", default=None, help="Vidéo de sortie (défaut : <input>_usm.avi).")
+    parser = argparse.ArgumentParser(
+        description="Applique USM sur toutes les frames d'une vidéo ou d'un dossier.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exemples :\n"
+            "  python ApplyUSM.py video.avi\n"
+            "  python ApplyUSM.py video.avi --output video_usm.avi\n"
+            "  python ApplyUSM.py dossier/ --output dossier_usm/\n"
+            "  python ApplyUSM.py dossier/ --output dossier_usm/ --sigma 1.5 --strength 3.0\n"
+        ),
+    )
+    parser.add_argument("input",  help="Vidéo .avi ou dossier contenant des vidéos .avi.")
+    parser.add_argument("--output",   default=None, help="Vidéo de sortie (vidéo unique) ou dossier de sortie (dossier).")
     parser.add_argument("--sigma",    type=float, default=2.0, help="Rayon Gaussien (défaut : 2.0).")
     parser.add_argument("--strength", type=float, default=2.0, help="Intensité USM (défaut : 2.0).")
     args = parser.parse_args()
 
     inp = Path(args.input)
-    out = Path(args.output) if args.output else inp.with_stem(inp.stem + "_usm")
+    if not inp.exists():
+        sys.exit(f"ERREUR : chemin introuvable : {inp}")
 
-    apply_usm_video(str(inp), str(out), sigma=args.sigma, strength=args.strength)
+    if inp.is_file():
+        out = Path(args.output) if args.output else inp.with_stem(inp.stem + "_usm")
+        apply_usm_video(str(inp), str(out), sigma=args.sigma, strength=args.strength)
+    else:
+        videos = sorted(inp.glob("*.avi"))
+        if not videos:
+            sys.exit(f"ERREUR : aucune vidéo .avi trouvée dans {inp}")
+
+        out_dir = Path(args.output) if args.output else inp.parent / f"{inp.name}_usm"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"  Mode batch : {len(videos)} vidéo(s)  →  {out_dir}\n")
+        failed: list[str] = []
+        for video_path in videos:
+            out_path = out_dir / f"{video_path.stem}_usm.avi"
+            try:
+                apply_usm_video(str(video_path), str(out_path), sigma=args.sigma, strength=args.strength)
+            except Exception as exc:
+                print(f"  [ERREUR] {video_path.name} : {exc}")
+                failed.append(video_path.name)
+
+        print(f"\n  Terminé : {len(videos) - len(failed)}/{len(videos)} vidéo(s) réussie(s)")
+        if failed:
+            print(f"  Échecs  : {', '.join(failed)}")
 
 
 if __name__ == "__main__":

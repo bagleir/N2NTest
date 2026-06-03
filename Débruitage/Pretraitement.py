@@ -163,6 +163,7 @@ def preprocess_video(
     info_mode: bool = True,
     output_video_path: Path | None = None,
     # step [1]
+    preset_mask_path: Path | None = None,
     n_sample_frames: int = MASK_N_SAMPLE_FRAMES,
     margin_px: int = MASK_MARGIN_PX,
     # step [2]
@@ -252,11 +253,21 @@ def preprocess_video(
 
     try:
         # ── Step [1] : Mask ───────────────────────────────────────────────────
-        _header(f"[1/6] Mask detection — {stem}")
+        _header(f"[1/6] Mask — {stem}")
 
         mask_path = working / "mask.png"
 
-        if mask_path.exists():
+        if preset_mask_path is not None:
+            # Use the provided mask directly — skip auto-detection
+            _sub(f"Masque prédéfini utilisé : {preset_mask_path}")
+            mask = cv2.imread(str(preset_mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise FileNotFoundError(f"Impossible de lire le masque : {preset_mask_path}")
+            if info_mode:
+                save_mask(mask, mask_path)
+            coverage = float(np.count_nonzero(mask)) / mask.size
+            _sub(f"coverage={coverage:.1%}")
+        elif mask_path.exists():
             _sub(f"Reusing cached mask : {mask_path.name}")
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             coverage = float(np.count_nonzero(mask)) / mask.size
@@ -752,14 +763,16 @@ def main() -> None:
             "    → video_final.avi next to the input\n\n"
             "  python Pretraitement.py video.avi output.avi\n"
             "    → final video saved as output.avi\n\n"
+            "  python Pretraitement.py --mask mon_masque.png video.avi\n"
+            "    → uses the provided mask instead of auto-detecting one\n\n"
             "  python Pretraitement.py --info video.avi\n"
             "    → ./preprocessed/video_stem/ with all diagnostics\n\n"
             "  python Pretraitement.py --info video.avi results/\n"
             "    → results/video_stem/ with all diagnostics\n\n"
             "  python Pretraitement.py folder/\n"
             "    → folder_final/<stem>.avi for each video (no intermediate files)\n\n"
-            "  python Pretraitement.py --info folder/ results/\n"
-            "    → results/<stem>/ for each video with all diagnostics\n"
+            "  python Pretraitement.py --mask mon_masque.png --info folder/ results/\n"
+            "    → results/<stem>/ for each video, all using the same mask\n"
         ),
     )
     parser.add_argument("input",  help=".avi video file or folder of videos")
@@ -774,10 +787,22 @@ def main() -> None:
         "--info", action="store_true",
         help="Save all intermediate files, visualisations, and diagnostic reports.",
     )
+    parser.add_argument(
+        "--mask", default=None,
+        help=(
+            "Chemin vers un masque PNG prédéfini à utiliser pour toutes les vidéos. "
+            "Si absent, le masque est détecté automatiquement (comportement par défaut)."
+        ),
+    )
 
     args       = parser.parse_args()
     input_path = Path(args.input)
     info_mode  = args.info
+    preset_mask: Path | None = Path(args.mask) if args.mask else None
+
+    if preset_mask is not None and not preset_mask.exists():
+        print(f"Error: mask not found — {preset_mask}")
+        sys.exit(1)
 
     if not input_path.exists():
         print(f"Error: path not found — {input_path}")
@@ -787,7 +812,8 @@ def main() -> None:
         if info_mode:
             out_root = Path(args.output) if args.output else Path.cwd() / "preprocessed"
             out_dir  = out_root / input_path.stem
-            summary  = preprocess_video(input_path, out_dir, info_mode=True)
+            summary  = preprocess_video(input_path, out_dir, info_mode=True,
+                                        preset_mask_path=preset_mask)
         else:
             out_video = (
                 Path(args.output) if args.output
@@ -796,6 +822,7 @@ def main() -> None:
             summary = preprocess_video(
                 input_path, Path("."), info_mode=False,
                 output_video_path=out_video,
+                preset_mask_path=preset_mask,
             )
             print(f"\n  Final video : {summary['final_video']}")
         sys.exit(0 if summary["status"] == "ok" else 1)
@@ -803,13 +830,15 @@ def main() -> None:
     else:
         if info_mode:
             out_root  = Path(args.output) if args.output else Path.cwd() / "preprocessed"
-            summaries = preprocess_folder(input_path, out_root, info_mode=True)
+            summaries = preprocess_folder(input_path, out_root, info_mode=True,
+                                          preset_mask_path=preset_mask)
         else:
             out_root  = (
                 Path(args.output) if args.output
                 else input_path.parent / f"{input_path.stem}_final"
             )
-            summaries = preprocess_folder(input_path, out_root, info_mode=False)
+            summaries = preprocess_folder(input_path, out_root, info_mode=False,
+                                          preset_mask_path=preset_mask)
             print(f"\n  Final videos saved to: {out_root}")
         sys.exit(1 if any(s["status"] == "error" for s in summaries) else 0)
 

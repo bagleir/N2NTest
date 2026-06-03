@@ -220,50 +220,21 @@ def generate_comparison_grid(
     log.info("Grille de comparaison → %s", output_path)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Inférence sur une vidéo ───────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Inférence FastDVDnet N2N")
-    parser.add_argument("--video",      required=True)
-    parser.add_argument("--config",     default=str(SCRIPT_DIR / "config.yaml"))
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--output",     default=None)
-    args = parser.parse_args()
-
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-
-    video_path = Path(args.video)
-    if not video_path.exists():
-        log.error("Vidéo introuvable : %s", video_path)
-        sys.exit(1)
-
-    ckpt_path = Path(args.checkpoint or (PROJECT_ROOT / cfg["inference"]["checkpoint"]))
-    if not ckpt_path.exists():
-        log.error("Checkpoint introuvable : %s", ckpt_path)
-        sys.exit(1)
-
-    mask_path = PROJECT_ROOT / cfg["data"]["mask_path"]
-    out_dir   = PROJECT_ROOT / cfg["inference"]["output_dir"]
-    out_path  = Path(args.output) if args.output else (out_dir / (video_path.stem + "_n2n.avi"))
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("Device : %s", device)
-
-    # ── Chargement du modèle ──────────────────────────────────────────────
-    model = FastDVDnet(features=cfg["model"]["features"]).to(device)
-    ckpt  = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    log.info("Modèle chargé — epoch %d | val loss=%.5f",
-             ckpt.get("epoch", 0), ckpt.get("val_loss", float("nan")))
-
-    mask = load_mask(mask_path)
-
-    # ── Étape 3 : temporal median filter ─────────────────────────────────
-    log.info("Étape 3 : temporal median filter…")
+def _run_one(
+    video_path: Path,
+    out_path:   Path,
+    model:      FastDVDnet,
+    mask:       np.ndarray,
+    cfg:        dict,
+    device:     torch.device,
+) -> None:
+    """Applique le pipeline complet (median + N2N) sur une vidéo."""
     tm_cfg      = cfg["inference"].get("temporal_median", {})
     median_path = out_path.with_name(out_path.stem + "_tmpmed.avi")
+
+    log.info("[%s] Étape 3 : temporal median filter…", video_path.name)
     temporal_median_filter(
         video_path       = str(video_path),
         mask             = mask,
@@ -272,8 +243,7 @@ def main() -> None:
         gaussian_weights = tm_cfg.get("gaussian_weights", True),
     )
 
-    # ── Étape 4 : FastDVDnet ──────────────────────────────────────────────
-    log.info("Étape 4 : débruitage FastDVDnet…")
+    log.info("[%s] Étape 4 : débruitage FastDVDnet…", video_path.name)
     median_frames, fps, size = _read_video_gray(median_path)
     denoised, mean_ms, vram_mb = denoise_video(
         frames          = median_frames,
@@ -284,20 +254,18 @@ def main() -> None:
         mixed_precision = cfg["training"]["mixed_precision"],
     )
     log.info(
-        "Inférence : %.2f ms/frame → %.1f FPS%s",
-        mean_ms, 1000.0 / max(mean_ms, 1e-3),
+        "[%s] Inférence : %.2f ms/frame → %.1f FPS%s",
+        video_path.name, mean_ms, 1000.0 / max(mean_ms, 1e-3),
         f" | VRAM peak : {vram_mb:.0f} MB" if vram_mb > 0 else "",
     )
     if mean_ms > 33.3:
-        log.warning("⚠ Dépasse le budget 33 ms/frame (objectif 30 fps)")
+        log.warning("⚠ [%s] Dépasse le budget 33 ms/frame", video_path.name)
 
-    # ── Étape 5 : sauvegarde ─────────────────────────────────────────────
-    log.info("Étape 5 : sauvegarde → %s", out_path)
+    log.info("[%s] Étape 5 : sauvegarde → %s", video_path.name, out_path)
     _save_video(denoised, out_path, fps, size)
 
-    # ── Grille de comparaison ─────────────────────────────────────────────
     if cfg["inference"]["comparison"]["enabled"]:
-        log.info("Génération de la grille de comparaison…")
+        log.info("[%s] Génération de la grille de comparaison…", video_path.name)
         preproc_frames, _, _ = _read_video_gray(video_path)
         generate_comparison_grid(
             preprocessed = preproc_frames,
@@ -312,7 +280,99 @@ def main() -> None:
     if median_path.exists():
         median_path.unlink()
 
-    log.info("Terminé.")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Inférence FastDVDnet N2N — vidéo unique ou dossier.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Résultats produits par vidéo :\n"
+            "  <stem>_n2n.avi          — vidéo débruitée\n"
+            "  <stem>_n2n_comparison.png — grille Prétraité / Median / N2N (si activé)\n\n"
+            "Exemples :\n"
+            "  python inference.py --video video.avi --checkpoint checkpoints/best_model.pth\n"
+            "  python inference.py --video video.avi --output denoised/video_n2n.avi\n"
+            "  python inference.py --video dossier/ --output denoised/ --checkpoint checkpoints/best_model.pth\n"
+            "  python inference.py --video dossier/ --mask mon_masque.png\n"
+        ),
+    )
+    parser.add_argument("--video",      required=True,
+        help="Vidéo .avi à débruiter, ou dossier contenant des vidéos .avi.")
+    parser.add_argument("--config",     default=str(SCRIPT_DIR / "config.yaml"),
+        help="Fichier de configuration YAML (défaut : config.yaml).")
+    parser.add_argument("--checkpoint", default=None,
+        help="Checkpoint .pth du modèle. Défaut : inference.checkpoint dans config.yaml.")
+    parser.add_argument("--output",     default=None,
+        help="Vidéo de sortie (vidéo unique) ou dossier de sortie (dossier). "
+             "Défaut : dossier inference.output_dir du config.")
+    parser.add_argument("--mask",       default=None,
+        help="Masque PNG à utiliser. Défaut : data.mask_path dans config.yaml.")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    inp = Path(args.video)
+    if not inp.exists():
+        log.error("Chemin introuvable : %s", inp)
+        sys.exit(1)
+
+    ckpt_path = Path(args.checkpoint or (PROJECT_ROOT / cfg["inference"]["checkpoint"]))
+    if not ckpt_path.exists():
+        log.error("Checkpoint introuvable : %s", ckpt_path)
+        sys.exit(1)
+
+    mask_path = Path(args.mask) if args.mask else (PROJECT_ROOT / cfg["data"]["mask_path"])
+    if not mask_path.exists():
+        log.error("Masque introuvable : %s", mask_path)
+        sys.exit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info("Device : %s", device)
+
+    model = FastDVDnet(features=cfg["model"]["features"]).to(device)
+    ckpt  = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    log.info("Modèle chargé — epoch %d | val loss=%.5f",
+             ckpt.get("epoch", 0), ckpt.get("val_loss", float("nan")))
+
+    mask = load_mask(mask_path)
+
+    # ── Vidéo unique ──────────────────────────────────────────────────────
+    if inp.is_file():
+        out_dir  = PROJECT_ROOT / cfg["inference"]["output_dir"]
+        out_path = Path(args.output) if args.output else (out_dir / (inp.stem + "_n2n.avi"))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_one(inp, out_path, model, mask, cfg, device)
+        log.info("Terminé → %s", out_path)
+        return
+
+    # ── Mode dossier ──────────────────────────────────────────────────────
+    videos = sorted(inp.glob("*.avi"))
+    if not videos:
+        log.error("Aucune vidéo .avi trouvée dans %s", inp)
+        sys.exit(1)
+
+    out_dir = Path(args.output) if args.output else (inp.parent / f"{inp.name}_n2n")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    log.info("Mode batch : %d vidéo(s)  →  %s", len(videos), out_dir)
+
+    failed: list[str] = []
+    for video_path in videos:
+        out_path = out_dir / f"{video_path.stem}_n2n.avi"
+        try:
+            _run_one(video_path, out_path, model, mask, cfg, device)
+        except Exception as exc:
+            log.error("[ERREUR] %s : %s", video_path.name, exc)
+            failed.append(video_path.name)
+
+    log.info("Terminé : %d/%d vidéo(s) réussie(s)%s",
+             len(videos) - len(failed), len(videos),
+             f"  |  Échecs : {', '.join(failed)}" if failed else "")
 
 
 if __name__ == "__main__":

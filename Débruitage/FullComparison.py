@@ -4,18 +4,20 @@ Pipeline de comparaison complète sur une frame de référence.
 
 Entrée : vidéo de base (non prétraitée).
 
-Génère automatiquement les 7 cas suivants (tous avec masque) :
-  1. Base avant prétraitement          → frame FRAME
-  2. Après prétraitement               → frame FRAME
-  3. Après prétraitement + USM         → frame FRAME
-  4. Après prétraitement  → projection (image temporelle)
+Génère automatiquement les 9 cas suivants (tous avec masque) :
+  1. Base avant prétraitement                       → frame FRAME
+  2. Après prétraitement                            → frame FRAME
+  3. Après prétraitement + USM                      → frame FRAME
+  4. Après prétraitement → projection (image temporelle)
   5. Après prétraitement + USM → projection
-  6. Après N2N (sur prétraité) → projection
-  7. Après N2N (sur USM)       → projection
+  6. Après N2N (sur prétraité 1024×1024) → projection
+  7. Après N2N (sur USM 1024×1024)       → projection
+  8. Prétraitement → Drizzle SR → USM    → projection SR
+  9. Prétraitement → N2N (512) → Drizzle SR → USM → projection SR  [nécessite checkpoint]
 
 Pour chaque cas : image complète + zoom 128×128 centré.
 Les projections (cas 4-7) sont upscalées à 1024×1024 (Lanczos).
-Pour les cas projection (4-7) : l'image projection est utilisée directement.
+Les cas 8-9 utilisent Drizzle pour la super-résolution temporelle (512→1024).
 
 Vidéos sauvegardées dans output_dir/videos/ :
   01_base_masked.avi   02_preprocessed.avi   03_usm.avi
@@ -24,10 +26,12 @@ Usage :
   python FullComparison.py video_base.avi
   python FullComparison.py video_base.avi --output-dir resultats/ --frame 50
   python FullComparison.py video_base.avi --checkpoint checkpoints/best.pth
+  python FullComparison.py video_base.avi --drop-size 0.5
 """
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -36,6 +40,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from skimage.filters import unsharp_mask as ski_usm
 
 import matplotlib
 matplotlib.use("Agg")
@@ -47,6 +52,7 @@ from Pretraitement import preprocess_video
 from ApplyUSM import apply_usm_video
 from ApplyMask import apply_mask_video
 from TemporalProjection import compute_projections
+from DrizzleSR import temporal_sr_drizzle
 
 PROJ_KEY    = "mean"   # clé de projection utilisée : 'mean' | 'percentile_90' | etc.
 CROP_SIZE   = 128
@@ -151,6 +157,24 @@ def _run_n2n(video_in: Path, video_out: Path, checkpoint: str, sdir: Path) -> bo
     return True
 
 
+def _apply_usm_image(img: np.ndarray, sigma: float, strength: float) -> np.ndarray:
+    """Applique USM sur une seule image (uint8 H×W)."""
+    sharpened = ski_usm(img, radius=sigma, amount=strength, preserve_range=True)
+    return np.clip(sharpened, 0, 255).astype(np.uint8)
+
+
+def _load_corrupted_frames(search_dirs: list[Path]) -> list[int]:
+    """Charge la liste des frames corrompues depuis step2_corrected.json."""
+    for d in search_dirs:
+        p = Path(d) / "step2_corrected.json"
+        if p.exists():
+            with open(p) as f:
+                frames = json.load(f).get("corrupted_frames", [])
+            print(f"  Frames corrompues : {len(frames)} (depuis {p.name})")
+            return frames
+    return []
+
+
 def _comparison_grid(
     cases: list[tuple[str, np.ndarray, np.ndarray]],
     output_path: Path,
@@ -203,6 +227,8 @@ def run_comparison(
     sigma:      float = 2.0,
     strength:   float = 2.0,
     crop_size:  int   = CROP_SIZE,
+    drop_size:  float = 0.7,
+    mask_path:  str | None = None,
 ) -> None:
     t0   = time.perf_counter()
     base = Path(base_video)
@@ -219,6 +245,15 @@ def run_comparison(
     mask_png  = vdir / f"{base.stem}_mask.png"
 
     preproc_work = out / "_preproc_work"
+
+    # Si un masque explicite est fourni, on l'utilise directement
+    if mask_path is not None:
+        src = Path(mask_path)
+        if not src.exists():
+            sys.exit(f"ERREUR : masque introuvable : {src}")
+        if not mask_png.exists() or src.resolve() != mask_png.resolve():
+            shutil.copy2(str(src), str(mask_png))
+        print(f"  Masque fourni : {src}")
 
     if p_preproc.exists() and mask_png.exists():
         print(f"  Cache trouvé : {p_preproc.name}  +  {mask_png.name}")
@@ -319,6 +354,28 @@ def run_comparison(
                            f"projection_{PROJ_KEY}", crop_size)
     cases.append((f"5. USM\n+ Projection", img, crop))
 
+    # ── Pré-calcul Drizzle SR (cas 8, indépendant du checkpoint N2N) ─────────
+    # Le résultat est stocké ici et inséré dans `cases` après les cas N2N
+    # pour respecter l'ordre 1-9 dans la grille de comparaison.
+    _step("Cas 8 — Drizzle SR (prétraité 512→1024) → USM")
+    p_drizzle_sr     = vdir / "08_drizzle_sr"
+    p_drizzle_sr_usm = vdir / "08_drizzle_sr_usm.png"
+    if p_drizzle_sr_usm.exists():
+        print(f"  Cache trouvé : {p_drizzle_sr_usm.name}")
+        _c8_img = cv2.imread(str(p_drizzle_sr_usm), cv2.IMREAD_GRAYSCALE)
+    else:
+        corrupted8 = _load_corrupted_frames([preproc_work, vdir, base.parent])
+        sr8 = temporal_sr_drizzle(
+            video_path      = p_preproc,
+            mask            = mask,
+            corrupted_frames= corrupted8,
+            output_path     = p_drizzle_sr,
+            drop_size       = drop_size,
+        )
+        _c8_img = _apply_usm_image(sr8["sr_image"], sigma=sigma, strength=strength)
+        _c8_img[~mask_bool_up] = 0
+        cv2.imwrite(str(p_drizzle_sr_usm), _c8_img)
+
     # ── Détection du checkpoint N2N ───────────────────────────────────────────
     ckpt = checkpoint
     if ckpt is None:
@@ -331,8 +388,10 @@ def run_comparison(
                 ckpt = str(candidate)
                 break
 
+    _c9_img: np.ndarray | None = None   # rempli si le checkpoint est disponible
+
     if ckpt is None or not Path(ckpt).exists():
-        print("\n  AVERTISSEMENT : checkpoint N2N introuvable — cas 6 & 7 ignorés.")
+        print("\n  AVERTISSEMENT : checkpoint N2N introuvable — cas 6, 7 & 9 ignorés.")
         print("  Utiliser --checkpoint <chemin.pth> pour les activer.\n")
     else:
         # ── Cas 6 : N2N (sur upscaled) → projection ──────────────────────────
@@ -363,6 +422,41 @@ def run_comparison(
                                    f"projection_{PROJ_KEY}", crop_size)
             cases.append(("7. N2N (USM upscalé)\n+ Projection", img, crop))
 
+        # ── Cas 9 : N2N (512×512) → Drizzle SR → USM (pré-calcul) ───────────
+        _step("Cas 9 — N2N (prétraité 512×512) → Drizzle SR → USM")
+        p_n2n_512            = vdir / "09_n2n_preproc_512.avi"
+        p_drizzle_n2n_sr_usm = vdir / "09_drizzle_n2n_sr_usm.png"
+        ok = True
+        if not p_n2n_512.exists():
+            ok = _run_n2n(p_preproc, p_n2n_512, ckpt, sdir)
+        else:
+            print(f"  Cache trouvé : {p_n2n_512.name}")
+        if ok and p_n2n_512.exists():
+            if p_drizzle_n2n_sr_usm.exists():
+                print(f"  Cache trouvé : {p_drizzle_n2n_sr_usm.name}")
+                _c9_img = cv2.imread(str(p_drizzle_n2n_sr_usm), cv2.IMREAD_GRAYSCALE)
+            else:
+                corrupted9 = _load_corrupted_frames([preproc_work, vdir, base.parent])
+                sr9 = temporal_sr_drizzle(
+                    video_path      = p_n2n_512,
+                    mask            = mask,
+                    corrupted_frames= corrupted9,
+                    output_path     = vdir / "09_drizzle_n2n_sr",
+                    drop_size       = drop_size,
+                )
+                _c9_img = _apply_usm_image(sr9["sr_image"], sigma=sigma, strength=strength)
+                _c9_img[~mask_bool_up] = 0
+                cv2.imwrite(str(p_drizzle_n2n_sr_usm), _c9_img)
+
+    # ── Cas 8 → ajouté après les cas N2N pour respecter l'ordre 1-9 ──────────
+    img, crop = _save_case(_c8_img, out / "cas_08_drizzle_sr_usm", "projection", crop_size)
+    cases.append(("8. Drizzle SR\n→ USM", img, crop))
+
+    # ── Cas 9 → ajouté en dernier si disponible ───────────────────────────────
+    if _c9_img is not None:
+        img, crop = _save_case(_c9_img, out / "cas_09_drizzle_n2n_usm", "projection", crop_size)
+        cases.append(("9. N2N → Drizzle SR\n→ USM", img, crop))
+
     # ── Grille synthétique ────────────────────────────────────────────────────
     if cases:
         _comparison_grid(cases, out / "comparison_grid.png", frame_idx, crop_size)
@@ -381,7 +475,7 @@ def run_comparison(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Comparaison complète du pipeline (7 cas) sur une frame de référence.",
+        description="Comparaison complète du pipeline (9 cas) sur une frame de référence.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("input",
@@ -391,13 +485,18 @@ def main() -> None:
     parser.add_argument("--frame", type=int, default=50,
         help="Indice de la frame de référence (défaut : 50).")
     parser.add_argument("--checkpoint", default=None,
-        help="Checkpoint N2N (.pth) pour les cas 6 & 7.")
+        help="Checkpoint N2N (.pth) pour les cas 6, 7 & 9.")
     parser.add_argument("--sigma",      type=float, default=2.0,
         help="Rayon Gaussien USM (défaut : 2.0).")
     parser.add_argument("--strength",   type=float, default=2.0,
         help="Intensité USM (défaut : 2.0).")
     parser.add_argument("--crop-size",  type=int, default=CROP_SIZE,
         help=f"Taille du zoom central en pixels (défaut : {CROP_SIZE}).")
+    parser.add_argument("--drop-size",  type=float, default=0.7,
+        help="Taille du noyau Drizzle en pixels HR (défaut : 0.7). "
+             "0.5=net, 0.7=équilibré, 1.0=moyenne.")
+    parser.add_argument("--mask", default=None,
+        help="Masque binaire PNG à utiliser directement (défaut : auto-généré par le prétraitement).")
     args = parser.parse_args()
 
     inp = Path(args.input)
@@ -414,7 +513,9 @@ def main() -> None:
     print(f"  Sortie      : {out_dir}")
     print(f"  Frame       : {args.frame}")
     print(f"  USM         : sigma={args.sigma}  strength={args.strength}")
+    print(f"  Drizzle     : drop_size={args.drop_size}")
     print(f"  Checkpoint  : {args.checkpoint or 'auto-detect'}")
+    print(f"  Masque      : {args.mask or 'auto-généré'}")
 
     run_comparison(
         base_video = str(inp),
@@ -424,6 +525,8 @@ def main() -> None:
         sigma      = args.sigma,
         strength   = args.strength,
         crop_size  = args.crop_size,
+        drop_size  = args.drop_size,
+        mask_path  = args.mask,
     )
 
 
