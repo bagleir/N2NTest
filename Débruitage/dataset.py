@@ -32,6 +32,10 @@ from mask_detection import load_mask
 
 log = logging.getLogger(__name__)
 
+# Pas de stride utilisé pour encoder la taille dans l'indice transmis par
+# MultiScaleBatchSampler.  Doit être > samples_per_epoch pour tout config raisonnable.
+_SCALE_STRIDE: int = 1_000_000
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -289,6 +293,7 @@ class VascularVideoDataset(Dataset):
         min_pair_correlation: float = 0.85,
         ecc_validation_n:     int   = 20,
         temporal_offset:      int   = 5,        # frames entre input et target (Option 1)
+        scale_configs:        list[dict] | None = None,  # [{"size":128,"weight":0.70}, ...]
     ) -> None:
         super().__init__()
         self.patch_size           = patch_size
@@ -301,6 +306,35 @@ class VascularVideoDataset(Dataset):
         self.ecc_max_px           = ecc_max_px
         self.min_pair_correlation = min_pair_correlation
         self.temporal_offset      = temporal_offset
+
+        # ── Multi-scale support ───────────────────────────────────────────────
+        # Si scale_configs est fourni, les tailles et poids sont extraits et
+        # normalisés.  Sinon, on retombe sur l'unique taille patch_size (mode
+        # rétrocompatible : comportement identique à l'ancienne version).
+        if scale_configs:
+            raw_sizes   = [int(s["size"])     for s in scale_configs]
+            raw_weights = [float(s["weight"]) for s in scale_configs]
+            total_w     = sum(raw_weights)
+            if abs(total_w - 1.0) > 1e-4:
+                log.warning(
+                    "[%s] multi_scale : poids somme à %.4f ≠ 1.0 — normalisation auto",
+                    split, total_w,
+                )
+                raw_weights = [w / total_w for w in raw_weights]
+            self.scale_sizes   = raw_sizes
+            self.scale_weights = np.array(raw_weights, dtype=np.float64)
+        else:
+            self.scale_sizes   = [patch_size]
+            self.scale_weights = np.array([1.0], dtype=np.float64)
+
+        log.info(
+            "[%s] Échelles actives : %s",
+            split,
+            "  ".join(
+                f"{s}×{s} ({w*100:.0f}%)"
+                for s, w in zip(self.scale_sizes, self.scale_weights)
+            ),
+        )
 
         # Normaliser video_dirs en liste de Path absolus
         if isinstance(video_dirs, (str, Path)):
@@ -643,7 +677,18 @@ class VascularVideoDataset(Dataset):
                 f"  → Lancer : python debug_pairs.py  pour inspection visuelle"
             )
 
-    def __getitem__(self, _: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        # ── Décoder la taille du patch depuis l'indice ────────────────────────
+        # MultiScaleBatchSampler encode la taille via :
+        #   indice = scale_code * _SCALE_STRIDE + position_dans_epoch
+        # Quand multi-scale est désactivé (scale_sizes = [patch_size]),
+        # scale_code vaut toujours 0 → comportement identique à l'ancienne version.
+        if len(self.scale_sizes) > 1:
+            scale_code = idx // _SCALE_STRIDE
+            ps = self.scale_sizes[min(scale_code, len(self.scale_sizes) - 1)]
+        else:
+            ps = self.scale_sizes[0]
+
         clip: np.ndarray | None = None
         target: np.ndarray | None = None
 
@@ -664,16 +709,22 @@ class VascularVideoDataset(Dataset):
             if self.b_clips:
                 clip, target = self._sample_b()
             elif self.a_pairs:
-                # Dernier recours : A sans validation (ne devrait pas arriver)
                 result = self._sample_a()
                 assert result is not None, "Aucune vidéo utilisable dans ce split"
                 clip, target = result
             else:
                 raise RuntimeError("Aucune source de données disponible")
 
-        rc   = _sample_valid_patch(self.mask, self.patch_size)
-        r, c = rc if rc is not None else (0, 0)
-        ps   = self.patch_size
+        # ── Extraction du patch ───────────────────────────────────────────────
+        # Pour ps ≥ H (ex. 512×512), on prend la frame entière (r=c=0) en évitant
+        # _sample_valid_patch dont le seuil de couverture échoue sur le cercle
+        # inscrit dans l'image (~78 % < 80 % par défaut).
+        H, W = self.mask.shape
+        if ps >= H:
+            r, c = 0, 0
+        else:
+            rc   = _sample_valid_patch(self.mask, ps)
+            r, c = rc if rc is not None else (0, 0)
 
         clip_p   = clip[:, r:r+ps, c:c+ps]
         target_p = target[r:r+ps, c:c+ps]
@@ -686,7 +737,122 @@ class VascularVideoDataset(Dataset):
         sigma_t  = torch.full((1, ps, ps), self.sigma_norm, dtype=torch.float32)
 
         return {
-            "frames": clip_t,
-            "target": target_t.unsqueeze(0),
-            "sigma":  sigma_t,
+            "frames":     clip_t,
+            "target":     target_t.unsqueeze(0),
+            "sigma":      sigma_t,
+            "patch_size": torch.tensor(ps, dtype=torch.long),
         }
+
+
+# ── Sampler multi-échelle ─────────────────────────────────────────────────────
+
+import math as _math
+from torch.utils.data import Sampler
+from typing import Iterator
+
+
+class MultiScaleBatchSampler(Sampler[list[int]]):
+    """
+    Génère des batches homogènes en taille de patch pour VascularVideoDataset.
+
+    Principe :
+      - À chaque epoch, distribue les N samples selon les poids des échelles.
+      - Encode la taille de patch dans l'indice via _SCALE_STRIDE :
+            indice = scale_code * _SCALE_STRIDE + position
+        VascularVideoDataset.__getitem__ décode scale_code pour choisir ps.
+      - Forme des batches de taille fixe par échelle (garantit que tous les
+        tenseurs d'un batch ont la même forme → collate_fn par défaut fonctionne).
+      - Mélange l'ordre des batches entre eux → le réseau voit les tailles dans
+        un ordre aléatoire à chaque epoch.
+
+    Compatible avec num_workers > 0 : la taille est encodée dans l'indice,
+    sans partage d'état entre le processus principal et les workers.
+
+    Args:
+        dataset        : instance de VascularVideoDataset.
+        batch_sizes_map: dict {taille_patch: batch_size}, ex. {128:32, 256:8, 512:2}.
+        drop_last      : abandonner le dernier batch incomplet (défaut False).
+    """
+
+    def __init__(
+        self,
+        dataset: "VascularVideoDataset",
+        batch_sizes_map: dict[int, int],
+        drop_last: bool = False,
+    ) -> None:
+        self.dataset         = dataset
+        self.batch_sizes_map = batch_sizes_map
+        self.drop_last       = drop_last
+
+    # ── Itération ─────────────────────────────────────────────────────────────
+
+    def __iter__(self) -> Iterator[list[int]]:
+        sizes   = self.dataset.scale_sizes
+        weights = self.dataset.scale_weights
+        total   = len(self.dataset)           # == samples_per_epoch
+
+        all_batches: list[list[int]] = []
+
+        for scale_code, (s, w) in enumerate(zip(sizes, weights)):
+            bs      = self.batch_sizes_map.get(s, 8)
+            n_scale = max(bs, round(total * float(w)))  # au moins 1 batch
+            base    = scale_code * _SCALE_STRIDE
+
+            # Indices encodant cette échelle
+            indices = list(range(base, base + n_scale))
+            np.random.shuffle(indices)
+
+            # Découpe en batches homogènes
+            for start in range(0, len(indices), bs):
+                batch = indices[start : start + bs]
+                if self.drop_last and len(batch) < bs:
+                    continue
+                if batch:
+                    all_batches.append(batch)
+
+        # Ordre aléatoire inter-échelles
+        np.random.shuffle(all_batches)
+        yield from all_batches
+
+    # ── Longueur (estimée) ────────────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        sizes   = self.dataset.scale_sizes
+        weights = self.dataset.scale_weights
+        total   = len(self.dataset)
+        n = 0
+        for s, w in zip(sizes, weights):
+            bs      = self.batch_sizes_map.get(s, 8)
+            n_scale = max(bs, round(total * float(w)))
+            n += (n_scale // bs) if self.drop_last else _math.ceil(n_scale / bs)
+        return n
+
+    # ── Diagnostic ────────────────────────────────────────────────────────────
+
+    def log_distribution(self, n_epochs: int = 1) -> None:
+        """
+        Affiche la distribution attendue des tailles de patch sur n_epochs epochs.
+        Utile pour vérifier la configuration avant de lancer l'entraînement.
+        """
+        sizes   = self.dataset.scale_sizes
+        weights = self.dataset.scale_weights
+        total   = len(self.dataset)
+        sep     = "─" * 52
+        print(f"\n{sep}")
+        print("  MultiScaleBatchSampler — distribution attendue")
+        print(f"  samples_per_epoch = {total}   n_epochs = {n_epochs}")
+        print(sep)
+        for s, w in zip(sizes, weights):
+            bs      = self.batch_sizes_map.get(s, 8)
+            n_scale = max(bs, round(total * float(w)))
+            n_batch = _math.ceil(n_scale / bs)
+            print(
+                f"  {s:3d}×{s:<3d}  poids={w*100:.0f}%"
+                f"  samples={n_scale:5d}"
+                f"  batch_size={bs:2d}"
+                f"  batches/epoch={n_batch:4d}"
+                f"  batches/run={n_batch * n_epochs:6d}"
+            )
+        print(sep)
+        print(f"  Batches totaux / epoch ≈ {len(self)}")
+        print(f"{sep}\n")

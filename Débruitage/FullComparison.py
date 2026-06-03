@@ -164,12 +164,23 @@ def _apply_usm_image(img: np.ndarray, sigma: float, strength: float) -> np.ndarr
 
 
 def _load_corrupted_frames(search_dirs: list[Path]) -> list[int]:
-    """Charge la liste des frames corrompues depuis step2_corrected.json."""
+    """
+    Charge la liste des frames corrompues depuis step2_corrected.json.
+
+    Gère deux formats de fichier :
+      • {"corrupted_frames": [0, 5, ...]}   — format explicite
+      • {"0": {...}, "5": {...}}             — format Pretraitement (clés = indices)
+    """
     for d in search_dirs:
         p = Path(d) / "step2_corrected.json"
         if p.exists():
             with open(p) as f:
-                frames = json.load(f).get("corrupted_frames", [])
+                data = json.load(f)
+            if "corrupted_frames" in data:
+                frames = [int(x) for x in data["corrupted_frames"]]
+            else:
+                # Clés = indices de frames sous forme de strings
+                frames = [int(k) for k in data.keys() if k.isdigit()]
             print(f"  Frames corrompues : {len(frames)} (depuis {p.name})")
             return frames
     return []
@@ -355,33 +366,81 @@ def run_comparison(
     cases.append((f"5. USM\n+ Projection", img, crop))
 
     # ── Pré-calcul Drizzle SR (cas 8, indépendant du checkpoint N2N) ─────────
-    # Le résultat est stocké ici et inséré dans `cases` après les cas N2N
-    # pour respecter l'ordre 1-9 dans la grille de comparaison.
+    # Inséré dans `cases` après les cas N2N pour respecter l'ordre 1-9.
+    # Encapsulé dans try/except : si Drizzle SR échoue (RuntimeError trop peu de
+    # frames valides, etc.), on bascule sur Lanczos SR.  L'exception ne bloque
+    # plus les cas 6 et 7.
     _step("Cas 8 — Drizzle SR (prétraité 512→1024) → USM")
+    _c8_img:   np.ndarray | None = None
+    _c8_label: str               = "8. Drizzle SR\n→ USM"
     p_drizzle_sr     = vdir / "08_drizzle_sr"
     p_drizzle_sr_usm = vdir / "08_drizzle_sr_usm.png"
+
     if p_drizzle_sr_usm.exists():
         print(f"  Cache trouvé : {p_drizzle_sr_usm.name}")
         _c8_img = cv2.imread(str(p_drizzle_sr_usm), cv2.IMREAD_GRAYSCALE)
     else:
         corrupted8 = _load_corrupted_frames([preproc_work, vdir, base.parent])
-        sr8 = temporal_sr_drizzle(
-            video_path      = p_preproc,
-            mask            = mask,
-            corrupted_frames= corrupted8,
-            output_path     = p_drizzle_sr,
-            drop_size       = drop_size,
-        )
-        _c8_img = _apply_usm_image(sr8["sr_image"], sigma=sigma, strength=strength)
-        _c8_img[~mask_bool_up] = 0
-        cv2.imwrite(str(p_drizzle_sr_usm), _c8_img)
+        try:
+            sr8     = temporal_sr_drizzle(
+                video_path      = p_preproc,
+                mask            = mask,
+                corrupted_frames= corrupted8,
+                output_path     = p_drizzle_sr,
+                drop_size       = drop_size,
+            )
+            _c8_img = _apply_usm_image(sr8["sr_image"], sigma=sigma, strength=strength)
+            _c8_img[~mask_bool_up] = 0
+            cv2.imwrite(str(p_drizzle_sr_usm), _c8_img)
+        except Exception as exc8:
+            # Drizzle SR peut échouer si trop peu de frames ont des décalages
+            # sous-pixeliques suffisamment diversifiés.  On bascule sur Lanczos.
+            print(f"\n  ⚠ Drizzle SR échoué ({exc8})")
+            print("  → Fallback : Lanczos SR (upscale × 2 depuis la médiane temporelle)")
+            try:
+                from DrizzleSR import lanczos_sr
+                _c8_lan = lanczos_sr(
+                    video_path       = p_preproc,
+                    mask             = mask,
+                    corrupted_frames = corrupted8,
+                    output_path      = vdir / "08_lanczos_sr",
+                    scale_factor     = 2,
+                )
+                _c8_img   = _apply_usm_image(_c8_lan, sigma=sigma, strength=strength)
+                _c8_img[~mask_bool_up] = 0
+                cv2.imwrite(str(p_drizzle_sr_usm), _c8_img)
+                _c8_label = "8. Lanczos SR\n→ USM (fallback)"
+                print("  → Lanczos SR OK")
+            except Exception as exc8b:
+                print(f"\n  ⚠ Lanczos SR également échoué ({exc8b}) — cas 8 ignoré")
 
     # ── Détection du checkpoint N2N ───────────────────────────────────────────
+    # Ordre de priorité :
+    #   1. checkpoint passé explicitement via --checkpoint
+    #   2. config.yaml → inference.checkpoint  (best_model.pth)
+    #   3. Candidats hardcodés (last.pth, best_model.pth)
     ckpt = checkpoint
     if ckpt is None:
+        # Lire le checkpoint recommandé dans config.yaml (même logique qu'inference.py)
+        try:
+            import yaml as _yaml
+            with open(sdir / "config.yaml") as _f:
+                _cfg_inf = _yaml.safe_load(_f)
+            _ckpt_rel = _cfg_inf.get("inference", {}).get("checkpoint", "")
+            if _ckpt_rel:
+                _ckpt_abs = (sdir.parent / _ckpt_rel).resolve()
+                if _ckpt_abs.exists():
+                    ckpt = str(_ckpt_abs)
+        except Exception:
+            pass
+
+    if ckpt is None:
         for candidate in [
+            sdir / "checkpoints" / "best_model.pth",
             sdir / "checkpoints" / "last.pth",
+            sdir.parent / "checkpoints" / "best_model.pth",
             sdir.parent / "checkpoints" / "last.pth",
+            sdir / "best_model.pth",
             sdir / "last.pth",
         ]:
             if candidate.exists():
@@ -392,8 +451,11 @@ def run_comparison(
 
     if ckpt is None or not Path(ckpt).exists():
         print("\n  AVERTISSEMENT : checkpoint N2N introuvable — cas 6, 7 & 9 ignorés.")
-        print("  Utiliser --checkpoint <chemin.pth> pour les activer.\n")
+        print("  → Lancer l'entraînement :  python train.py")
+        print("  → Ou préciser le chemin : --checkpoint checkpoints/best_model.pth\n")
     else:
+        print(f"  Checkpoint : {ckpt}")
+
         # ── Cas 6 : N2N (sur upscaled) → projection ──────────────────────────
         _step("Cas 6 — N2N sur upscalé + projection")
         p_n2n_pre = vdir / "n2n_upscaled.avi"
@@ -422,7 +484,7 @@ def run_comparison(
                                    f"projection_{PROJ_KEY}", crop_size)
             cases.append(("7. N2N (USM upscalé)\n+ Projection", img, crop))
 
-        # ── Cas 9 : N2N (512×512) → Drizzle SR → USM (pré-calcul) ───────────
+        # ── Cas 9 : N2N (512×512) → Drizzle SR → USM ─────────────────────────
         _step("Cas 9 — N2N (prétraité 512×512) → Drizzle SR → USM")
         p_n2n_512            = vdir / "09_n2n_preproc_512.avi"
         p_drizzle_n2n_sr_usm = vdir / "09_drizzle_n2n_sr_usm.png"
@@ -437,20 +499,26 @@ def run_comparison(
                 _c9_img = cv2.imread(str(p_drizzle_n2n_sr_usm), cv2.IMREAD_GRAYSCALE)
             else:
                 corrupted9 = _load_corrupted_frames([preproc_work, vdir, base.parent])
-                sr9 = temporal_sr_drizzle(
-                    video_path      = p_n2n_512,
-                    mask            = mask,
-                    corrupted_frames= corrupted9,
-                    output_path     = vdir / "09_drizzle_n2n_sr",
-                    drop_size       = drop_size,
-                )
-                _c9_img = _apply_usm_image(sr9["sr_image"], sigma=sigma, strength=strength)
-                _c9_img[~mask_bool_up] = 0
-                cv2.imwrite(str(p_drizzle_n2n_sr_usm), _c9_img)
+                try:
+                    sr9     = temporal_sr_drizzle(
+                        video_path      = p_n2n_512,
+                        mask            = mask,
+                        corrupted_frames= corrupted9,
+                        output_path     = vdir / "09_drizzle_n2n_sr",
+                        drop_size       = drop_size,
+                    )
+                    _c9_img = _apply_usm_image(sr9["sr_image"], sigma=sigma, strength=strength)
+                    _c9_img[~mask_bool_up] = 0
+                    cv2.imwrite(str(p_drizzle_n2n_sr_usm), _c9_img)
+                except Exception as exc9:
+                    print(f"\n  ⚠ Drizzle SR (cas 9) échoué ({exc9}) — cas 9 ignoré")
 
     # ── Cas 8 → ajouté après les cas N2N pour respecter l'ordre 1-9 ──────────
-    img, crop = _save_case(_c8_img, out / "cas_08_drizzle_sr_usm", "projection", crop_size)
-    cases.append(("8. Drizzle SR\n→ USM", img, crop))
+    if _c8_img is not None:
+        img, crop = _save_case(_c8_img, out / "cas_08_drizzle_sr_usm", "projection", crop_size)
+        cases.append((_c8_label, img, crop))
+    else:
+        print("  Cas 8 ignoré (Drizzle SR et Lanczos SR ont tous deux échoué)")
 
     # ── Cas 9 → ajouté en dernier si disponible ───────────────────────────────
     if _c9_img is not None:

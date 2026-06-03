@@ -4,18 +4,36 @@
 
 data:
   # ── Sources vidéo ─────────────────────────────────────────────────────
-  # Lister ici TOUS les dossiers contenant des vidéos d'entraînement.
-  # Chaque dossier est scanné récursivement selon video_pattern.
   video_dirs:
-    - "TemporelIntegrale"          # vidéos *_step7_temporal_median.avi
-    # - "AutreBanque"              # décommenter pour ajouter d'autres sources
-  video_pattern: "*.avi"           # accepte toutes les vidéos .avi
+    - "TemporelIntegrale"
+  video_pattern: "*.avi"
 
   mask_path: "PretraitementIntegrale/mask.png"
-  patch_size: 128
+  patch_size: 128          # taille par défaut (rétrocompatibilité — ignoré si multi_scale.enabled)
   frames_per_clip: 5
   train_split: 0.80
   val_split:   0.20
+
+  # ── Multi-scale training ───────────────────────────────────────────────
+  # Si enabled=false → seul patch_size est utilisé, comportement identique
+  # à l'ancienne version (aucune régression possible).
+  # Les poids doivent sommer à 1.0 ; sinon ils sont normalisés automatiquement
+  # avec un warning au démarrage.
+  multi_scale:
+    enabled: true
+    scales:
+      - size:       128
+        weight:     0.70    # 70 % des samples
+        batch_size: 32
+        grad_clip:  1.0
+      - size:       256
+        weight:     0.20    # 20 % des samples
+        batch_size: 8
+        grad_clip:  1.0
+      - size:       512
+        weight:     0.10    # 10 % des samples — frame entière (pas de crop)
+        batch_size: 2
+        grad_clip:  0.5     # plus conservateur sur grande image
 
   # ── Stratégie N2N ─────────────────────────────────────────────────────
   # "B"    : bruit synthétique uniquement (recommandé — paires A non validées)
@@ -24,29 +42,25 @@ data:
   force_strategy: "B"
 
   # Alignement ECC (stratégie A uniquement)
-  ecc_max_px:           3.0   # rejeter la paire si déplacement résiduel > N px
-  min_pair_correlation: 0.85  # rejeter si corrélation dans masque < seuil
-  ecc_validation_n:     20    # nb de paires testées au démarrage pour les stats
+  ecc_max_px:           3.0
+  min_pair_correlation: 0.85
+  ecc_validation_n:     20
 
   # ── Stratégie B — construction des paires ────────────────────────────
-  # Option 1 (recommandée) : paire temporelle — input=frame_t, target=frame_{t+offset}
-  #   Le bruit à t et t+offset est indépendant (capteur à des instants différents).
-  #   temporal_offset > 2 garantit que la target est hors de la fenêtre d'input.
   temporal_offset: 5     # frames entre input et target (doit être > 2)
-
-  # Option 2 (fallback) : double bruit indépendant sur la même frame de base
-  #   utilisé si la vidéo est trop courte pour l'offset temporel
-  sigma_noise:   4.4     # std bruit gaussien (échelle 0-255)
-  poisson_scale: 0.5     # proportion bruit de Poisson (0 = gaussien pur)
+  sigma_noise:   4.4
+  poisson_scale: 0.5
 
 model:
   features: 64
 
 training:
-  epochs:     100
-  batch_size: 8
+  epochs:        150      # augmenté (était 100)
+  batch_size:    8        # utilisé uniquement si multi_scale.enabled=false
 
-  lr:         1.0e-4
+  lr:            2.0e-4   # augmenté selon linear scaling rule (était 1.0e-4)
+  warmup_epochs: 5        # LR monte linéairement de lr/20 → lr sur ces epochs
+                          # puis CosineAnnealingLR jusqu'à la fin
 
   # Poids de la loss totale
   w_l1:             0.70
@@ -56,7 +70,7 @@ training:
   lambda_pulsation: 0.05
   pulsation_threshold: 0.7
 
-  grad_clip: 1.0
+  grad_clip: 1.0          # fallback si la taille n'est pas dans multi_scale.scales
 
   optimizer: adam
   scheduler: cosine
@@ -69,24 +83,25 @@ training:
   mixed_precision: true
   num_workers: 4
   pin_memory:  true
-  # Réduit à 128 (était 512) — évite l'overfitting sur peu de vidéos
   samples_per_epoch_multiplier: 128
   recursive_video_scan: true
 
   # ── Alertes de surveillance ────────────────────────────────────────────
-  # Alerte oscillation : seuil + tendance + epoch minimum
-  oscillation_std_threshold: 0.010   # std(val[-10:]) > seuil
-  oscillation_min_epoch:     40      # pas d'alerte avant cette epoch
-  stagnation_patience:       15      # alerte si pas d'amélioration pendant N epochs
+  oscillation_std_threshold: 0.010
+  oscillation_min_epoch:     40
+  stagnation_patience:       15
 
 sr:
-  scale_factor:    2       # output resolution = input × scale_factor  (512→1024)
-  drop_size:       0.7     # drizzle kernel size in HR pixels (0.5=sharp, 1.0=mean)
-  upsample_factor: 100     # sub-pixel precision = 1/upsample_factor px
-  n_frames_max:    null    # null = use all valid frames
-  min_frames:      20      # abort if fewer valid frames remain
+  scale_factor:    2
+  drop_size:       0.7
+  upsample_factor: 100
+  n_frames_max:    null
+  min_frames:      20
 
 inference:
+  # inference.py n'a PAS besoin d'être modifié pour le multi-scale :
+  # FastDVDnet est fully convolutional et traite les frames 512×512 entières
+  # en un seul passage, quelle que soit la taille utilisée à l'entraînement.
   checkpoint: "Débruitage/checkpoints/best_model.pth"
   output_dir: "Débruitage/denoised"
 
