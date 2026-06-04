@@ -320,8 +320,13 @@ def main() -> None:
         sys.exit(1)
 
     ckpt_path = Path(args.checkpoint or (PROJECT_ROOT / cfg["inference"]["checkpoint"]))
-    if not ckpt_path.exists():
-        log.error("Checkpoint introuvable : %s", ckpt_path)
+    if ckpt_path.is_dir():
+        for _name in ("best_model.pth", "last.pth"):
+            if (ckpt_path / _name).is_file():
+                ckpt_path = ckpt_path / _name
+                break
+    if not ckpt_path.is_file():
+        log.error("Checkpoint introuvable (ou chemin vers un dossier) : %s", ckpt_path)
         sys.exit(1)
 
     mask_path = Path(args.mask) if args.mask else (PROJECT_ROOT / cfg["data"]["mask_path"])

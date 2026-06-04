@@ -379,7 +379,7 @@ def run_comparison(
             _ckpt_rel = _cfg_inf.get("inference", {}).get("checkpoint", "")
             if _ckpt_rel:
                 _ckpt_abs = (sdir.parent / _ckpt_rel).resolve()
-                if _ckpt_abs.exists():
+                if _ckpt_abs.is_file():
                     ckpt = str(_ckpt_abs)
         except Exception:
             pass
@@ -393,13 +393,23 @@ def run_comparison(
             sdir / "best_model.pth",
             sdir / "last.pth",
         ]:
-            if candidate.exists():
+            if candidate.is_file():
                 ckpt = str(candidate)
                 break
 
+    # Si le checkpoint pointe vers un dossier, chercher best_model.pth / last.pth dedans.
+    if ckpt is not None and Path(ckpt).is_dir():
+        for _name in ("best_model.pth", "last.pth"):
+            _candidate = Path(ckpt) / _name
+            if _candidate.is_file():
+                ckpt = str(_candidate)
+                break
+        else:
+            ckpt = None  # dossier sans .pth valide
+
     _c9_img: np.ndarray | None = None   # rempli si le checkpoint est disponible
 
-    if ckpt is None or not Path(ckpt).exists():
+    if ckpt is None or not Path(ckpt).is_file():
         print("\n  AVERTISSEMENT : checkpoint N2N introuvable — cas 6, 7 & 9 ignorés.")
         print("  → Lancer l'entraînement :  python train.py")
         print("  → Ou préciser le chemin : --checkpoint checkpoints/best_model.pth\n")
