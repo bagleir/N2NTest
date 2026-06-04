@@ -633,11 +633,76 @@ def train(config_path: str, resume_path: str | None = None) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=str(SCRIPT_DIR / "config.yaml"))
-    parser.add_argument("--resume", default=None)
+    parser = argparse.ArgumentParser(
+        description="Entraînement FastDVDnet N2N pour vidéos vasculaires.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Exemples :\n"
+            "  python train.py\n"
+            "  python train.py --video-dirs MesDonnees/ AutreBanque/\n"
+            "  python train.py --video-dirs MesDonnees/ --mask MesDonnees/mask.png\n"
+            "  python train.py --epochs 50 --batch-size 4 --lr 5e-5\n"
+            "  python train.py --resume checkpoints/last.pth\n"
+        ),
+    )
+    parser.add_argument("--config",  default=str(SCRIPT_DIR / "config.yaml"),
+        help="Fichier de configuration YAML (défaut : config.yaml)")
+    parser.add_argument("--resume",  default=None,
+        help="Reprendre depuis un checkpoint (.pth)")
+
+    # Overrides — ces arguments écrasent les valeurs du config.yaml si fournis
+    parser.add_argument("--video-dirs", nargs="+", default=None,
+        help="Un ou plusieurs dossiers de vidéos d'entraînement "
+             "(relatifs à la racine du projet Stage/). "
+             "Écrase data.video_dirs dans config.yaml.")
+    parser.add_argument("--mask", default=None,
+        help="Chemin vers le masque .png "
+             "(relatif à Stage/). Écrase data.mask_path.")
+    parser.add_argument("--epochs", type=int, default=None,
+        help="Nombre d'epochs. Écrase training.epochs.")
+    parser.add_argument("--batch-size", type=int, default=None,
+        help="Taille de batch. Écrase training.batch_size.")
+    parser.add_argument("--lr", type=float, default=None,
+        help="Learning rate initial. Écrase training.lr.")
+    parser.add_argument("--checkpoint-dir", default=None,
+        help="Dossier de sauvegarde des checkpoints "
+             "(relatif à Stage/). Écrase training.checkpoint_dir.")
+
     args = parser.parse_args()
-    train(args.config, args.resume)
+
+    # Charger le config de base
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    # Appliquer les overrides CLI
+    if args.video_dirs is not None:
+        cfg["data"]["video_dirs"] = args.video_dirs
+        log.info("Override video_dirs → %s", args.video_dirs)
+    if args.mask is not None:
+        cfg["data"]["mask_path"] = args.mask
+        log.info("Override mask_path  → %s", args.mask)
+    if args.epochs is not None:
+        cfg["training"]["epochs"] = args.epochs
+        log.info("Override epochs     → %d", args.epochs)
+    if args.batch_size is not None:
+        cfg["training"]["batch_size"] = args.batch_size
+        log.info("Override batch_size → %d", args.batch_size)
+    if args.lr is not None:
+        cfg["training"]["lr"] = args.lr
+        log.info("Override lr         → %g", args.lr)
+    if args.checkpoint_dir is not None:
+        cfg["training"]["checkpoint_dir"] = args.checkpoint_dir
+        log.info("Override ckpt_dir   → %s", args.checkpoint_dir)
+
+    # Écrire le config résultant dans un fichier temporaire et lancer
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
+        yaml.dump(cfg, tmp)
+        tmp_path = tmp.name
+    try:
+        train(tmp_path, args.resume)
+    finally:
+        os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
