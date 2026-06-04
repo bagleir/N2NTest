@@ -14,7 +14,6 @@ import math
 import shutil
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +21,6 @@ import torch
 import torch.nn as nn
 import yaml
 from torch.cuda.amp import GradScaler
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -30,7 +28,7 @@ SCRIPT_DIR   = Path(__file__).resolve().parent   # Stage/Débruitage/
 PROJECT_ROOT = SCRIPT_DIR.parent                 # Stage/
 
 from model   import FastDVDnet
-from dataset import MultiScaleBatchSampler, VascularVideoDataset
+from dataset import VascularVideoDataset
 
 logging.basicConfig(
     level    = logging.INFO,
@@ -50,36 +48,6 @@ def _ram_mb() -> float:
     except Exception:
         pass
     return 0.0
-
-
-# ── Scheduler avec warmup ─────────────────────────────────────────────────────
-
-def _build_scheduler_with_warmup(
-    optimizer:      torch.optim.Optimizer,
-    warmup_epochs:  int,
-    total_epochs:   int,
-) -> torch.optim.lr_scheduler.LRScheduler:
-    """
-    Epochs 1 → warmup_epochs   : LR monte linéairement de lr/20 → lr  (LinearLR).
-    Epochs warmup → total       : CosineAnnealingLR de lr → 0.
-
-    Implémenté avec SequentialLR (PyTorch ≥ 1.13).
-    Si warmup_epochs == 0, retourne directement un CosineAnnealingLR.
-    """
-    if warmup_epochs <= 0:
-        return CosineAnnealingLR(optimizer, T_max=max(total_epochs, 1))
-
-    warmup = LinearLR(
-        optimizer,
-        start_factor = 1.0 / 20,
-        end_factor   = 1.0,
-        total_iters  = warmup_epochs,
-    )
-    cosine = CosineAnnealingLR(
-        optimizer,
-        T_max = max(total_epochs - warmup_epochs, 1),
-    )
-    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
@@ -103,14 +71,7 @@ def _pulsation_preservation_loss(
     target:    torch.Tensor,
     threshold: float,
 ) -> torch.Tensor:
-    """Pénalise si var(output) < threshold × var(target) — préserve la pulsation cardiaque.
-
-    Requiert batch_size ≥ 2 pour que var(dim=0) soit définie.
-    Avec un seul sample (dernier batch d'une échelle si drop_last=False),
-    var() renverrait NaN → on retourne 0 plutôt que de corrompre la loss.
-    """
-    if output.shape[0] < 2:
-        return torch.zeros(1, device=output.device)[0]
+    """Pénalise si var(output) < threshold × var(target) — préserve la pulsation cardiaque."""
     return torch.relu(threshold * target.var(dim=0).mean() - output.var(dim=0).mean())
 
 
@@ -320,19 +281,13 @@ def _save_samples(
     targets: torch.Tensor,
     epoch:   int,
     out_dir: Path,
-    scale:   int | None = None,
 ) -> None:
-    """Sauvegarde jusqu'à 3 PNGs comparatifs : input bruité | output réseau | target.
-
-    Le nom de fichier inclut l'échelle quand elle est fournie :
-        epoch0010_scale128_sample1.png
-    """
+    """Sauvegarde 3 PNGs comparatifs : input bruité | output réseau | target."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    scale_tag = f"_scale{scale}" if scale is not None else ""
     for i in range(min(3, inputs.shape[0])):
         fig, axes = plt.subplots(1, 3, figsize=(9, 3))
         for ax, img, title in zip(
@@ -343,10 +298,9 @@ def _save_samples(
             ax.imshow(img.cpu().numpy(), cmap="gray", vmin=0, vmax=1)
             ax.set_title(title, fontsize=9)
             ax.axis("off")
-        size_str = f"{scale}×{scale}" if scale is not None else ""
-        fig.suptitle(f"Epoch {epoch}{f'  —  {size_str}' if size_str else ''}  —  exemple {i + 1}", fontsize=10)
+        fig.suptitle(f"Epoch {epoch} — exemple {i + 1}", fontsize=10)
         fig.tight_layout()
-        fig.savefig(out_dir / f"epoch{epoch:04d}{scale_tag}_sample{i + 1}.png", dpi=100)
+        fig.savefig(out_dir / f"epoch{epoch:04d}_sample{i + 1}.png", dpi=100)
         plt.close(fig)
 
 
@@ -388,32 +342,8 @@ def train(config_path: str, resume_path: str | None = None) -> None:
     log.info("Vidéos      → %s (pattern=%s)", [str(d) for d in video_dirs], video_pattern)
     log.info("Masque      → %s", mask_path)
 
-    # ── Lecture de la config multi-scale ─────────────────────────────────────
-    ms_raw     = d_cfg.get("multi_scale", {})
-    ms_enabled = bool(ms_raw.get("enabled", False))
-    ms_scales  = ms_raw.get("scales", []) if ms_enabled else []
-
-    # Construit les tables {taille: batch_size} et {taille: grad_clip}
-    batch_sizes_map: dict[int, int]   = {}
-    grad_clip_map:   dict[int, float] = {}
-    for s_cfg in ms_scales:
-        sz = int(s_cfg["size"])
-        batch_sizes_map[sz] = int(s_cfg.get("batch_size", t_cfg["batch_size"]))
-        grad_clip_map[sz]   = float(s_cfg.get("grad_clip", t_cfg.get("grad_clip", 1.0)))
-
-    # scale_configs transmis au dataset (None = mode mono-échelle rétrocompat.)
-    scale_configs_list: list[dict] | None = ms_scales if ms_enabled else None
-
-    # samples_per_epoch basé sur training.batch_size × multiplier (référence)
     spe = t_cfg["batch_size"] * t_cfg["samples_per_epoch_multiplier"]
-    if ms_enabled:
-        log.info(
-            "Multi-scale ACTIVÉ — %d échelles : %s",
-            len(ms_scales),
-            "  ".join(f"{s['size']}×{s['size']}(bs={batch_sizes_map[s['size']]})"
-                      for s in ms_scales),
-        )
-    log.info("Samples/epoch train : %d (batch_ref=%d × mult=%d)",
+    log.info("Samples/epoch train : %d (batch=%d × mult=%d)",
              spe, t_cfg["batch_size"], t_cfg["samples_per_epoch_multiplier"])
 
     log.info("─" * 60)
@@ -433,7 +363,6 @@ def train(config_path: str, resume_path: str | None = None) -> None:
         min_pair_correlation  = d_cfg.get("min_pair_correlation", 0.85),
         ecc_validation_n      = d_cfg.get("ecc_validation_n", 20),
         temporal_offset       = d_cfg.get("temporal_offset", 5),
-        scale_configs         = scale_configs_list,
     )
     train_ds = VascularVideoDataset(
         **ds_kwargs,
@@ -452,36 +381,17 @@ def train(config_path: str, resume_path: str | None = None) -> None:
     log.info("─" * 60)
     log.info("RAM après datasets : %.0f MB", _ram_mb())
 
-    _dl_kwargs = dict(
-        num_workers = t_cfg["num_workers"],
-        pin_memory  = t_cfg["pin_memory"] and device.type == "cuda",
-    )
-
-    if ms_enabled:
-        # drop_last=True : évite les batches partiels (ex. 1 sample sur les 819 du 512×512)
-        # qui causent var(dim=0) indéfinie → NaN dans _pulsation_preservation_loss.
-        train_sampler = MultiScaleBatchSampler(train_ds, batch_sizes_map, drop_last=True)
-        val_sampler   = MultiScaleBatchSampler(val_ds,   batch_sizes_map, drop_last=True)
-        train_dl = DataLoader(train_ds, batch_sampler=train_sampler, **_dl_kwargs)
-        val_dl   = DataLoader(val_ds,   batch_sampler=val_sampler,   **_dl_kwargs)
-        # Afficher la distribution prévue pour vérification au démarrage
-        train_sampler.log_distribution(n_epochs=t_cfg["epochs"])
-    else:
-        train_dl = DataLoader(train_ds, batch_size=t_cfg["batch_size"], shuffle=True,  **_dl_kwargs)
-        val_dl   = DataLoader(val_ds,   batch_size=t_cfg["batch_size"], shuffle=False, **_dl_kwargs)
-
-    log.info("DataLoaders créés (num_workers=%d, multi_scale=%s)",
-             t_cfg["num_workers"], ms_enabled)
+    train_dl = DataLoader(train_ds, batch_size=t_cfg["batch_size"], shuffle=True,
+                          num_workers=t_cfg["num_workers"],
+                          pin_memory=t_cfg["pin_memory"] and device.type == "cuda")
+    val_dl   = DataLoader(val_ds,   batch_size=t_cfg["batch_size"],
+                          num_workers=t_cfg["num_workers"],
+                          pin_memory=t_cfg["pin_memory"] and device.type == "cuda")
+    log.info("DataLoaders créés (num_workers=%d)", t_cfg["num_workers"])
 
     model     = FastDVDnet(features=cfg["model"]["features"]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=t_cfg["lr"])
-    warmup_ep = int(t_cfg.get("warmup_epochs", 0))
-    scheduler = _build_scheduler_with_warmup(optimizer, warmup_ep, t_cfg["epochs"])
-    log.info(
-        "Scheduler : %s (warmup=%d ep → cosine %d ep)",
-        "warmup+cosine" if warmup_ep > 0 else "cosine",
-        warmup_ep, t_cfg["epochs"] - warmup_ep,
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_cfg["epochs"])
     criterion = N2NLoss(
         w_l1                = t_cfg.get("w_l1",             0.70),
         w_ssim              = t_cfg.get("w_ssim",           0.30),
@@ -490,10 +400,9 @@ def train(config_path: str, resume_path: str | None = None) -> None:
         lambda_pulsation    = t_cfg["lambda_pulsation"],
         pulsation_threshold = t_cfg["pulsation_threshold"],
     )
-    use_amp        = t_cfg["mixed_precision"] and device.type == "cuda"
-    grad_clip      = float(t_cfg.get("grad_clip", 1.0))   # valeur par défaut / fallback
-    # torch.cuda.amp.GradScaler est déprécié depuis PyTorch 2.x
-    scaler         = torch.amp.GradScaler("cuda", enabled=use_amp)
+    use_amp   = t_cfg["mixed_precision"] and device.type == "cuda"
+    grad_clip = t_cfg.get("grad_clip", 1.0)
+    scaler    = GradScaler(enabled=use_amp)
 
     log.info("Modèle FastDVDnet : %.2fM paramètres", sum(p.numel() for p in model.parameters()) / 1e6)
     log.info("Mixed precision AMP : %s  |  grad_clip=%.1f", use_amp, grad_clip)
@@ -509,12 +418,7 @@ def train(config_path: str, resume_path: str | None = None) -> None:
         ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        try:
-            scheduler.load_state_dict(ckpt["scheduler"])
-        except Exception as exc:
-            # Le type de scheduler a changé (ex. cosine → warmup+cosine) :
-            # on repart du début du scheduler sans planter.
-            log.warning("Scheduler state incompatible avec le checkpoint (%s) — scheduler réinitialisé", exc)
+        scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_val    = ckpt.get("best_val", math.inf)
         log.info("Reprise depuis epoch %d (best val=%.6f)", start_epoch - 1, best_val)
@@ -544,9 +448,7 @@ def train(config_path: str, resume_path: str | None = None) -> None:
 
         # ── Train ──────────────────────────────────────────────────────────
         model.train()
-        train_l, train_s                                   = [], []
-        scale_train_l: dict[int, list[float]]              = defaultdict(list)
-        scale_train_s: dict[int, list[float]]              = defaultdict(list)
+        train_l, train_s = [], []
 
         batch_bar = tqdm(
             train_dl,
@@ -558,12 +460,9 @@ def train(config_path: str, resume_path: str | None = None) -> None:
         )
         nan_batches = 0
         for batch in batch_bar:
-            frames     = batch["frames"].to(device)
-            target     = batch["target"].to(device)
-            sigma      = batch["sigma"].to(device)
-            # patch_size homogène dans un batch (garanti par MultiScaleBatchSampler)
-            current_ps = int(batch["patch_size"][0].item())
-            clip_val   = grad_clip_map.get(current_ps, grad_clip)
+            frames = batch["frames"].to(device)
+            target = batch["target"].to(device)
+            sigma  = batch["sigma"].to(device)
 
             optimizer.zero_grad()
 
@@ -581,33 +480,28 @@ def train(config_path: str, resume_path: str | None = None) -> None:
                 if nan_batches <= 3:
                     tqdm.write(
                         f"  ⚠ NaN/Inf loss à batch {len(train_l)} "
-                        f"ps={current_ps} "
                         f"(L1={loss_parts['l1']:.4f} "
                         f"ssim={loss_parts['ssim']:.4f} "
                         f"grad={loss_parts['grad']:.4f}) — batch ignoré"
                     )
                 continue
 
-            # Backward + gradient clipping (adapté à la taille) + step
+            # Backward + gradient clipping + step
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)   # doit précéder clip_grad_norm_
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_val)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
-            lv = loss.item()
-            train_l.append(lv)
-            scale_train_l[current_ps].append(lv)
+            train_l.append(loss.item())
             with torch.no_grad():
-                sv = _ssim(output.detach(), target)
-                train_s.append(sv)
-                scale_train_s[current_ps].append(sv)
+                train_s.append(_ssim(output.detach(), target))
 
             batch_bar.set_postfix(
-                loss = f"{lv:.4f}",
-                ps   = current_ps,
+                loss = f"{loss.item():.4f}",
                 L1   = f"{loss_parts['l1']:.4f}",
                 ssim = f"{loss_parts['ssim']:.4f}",
+                grad = f"{loss_parts['grad']:.4f}",
                 avg  = f"{float(np.mean(train_l)):.4f}",
             )
 
@@ -618,10 +512,7 @@ def train(config_path: str, resume_path: str | None = None) -> None:
 
         # ── Validation ────────────────────────────────────────────────────
         model.eval()
-        val_l, val_s                                       = [], []
-        scale_val_l: dict[int, list[float]]                = defaultdict(list)
-        scale_val_s: dict[int, list[float]]                = defaultdict(list)
-        saved_by_scale: dict[int, tuple]                   = {}   # ps → (in, out, tgt)
+        val_l, val_s, saved = [], [], None
 
         val_bar = tqdm(
             val_dl,
@@ -633,24 +524,17 @@ def train(config_path: str, resume_path: str | None = None) -> None:
         )
         with torch.no_grad():
             for batch in val_bar:
-                frames     = batch["frames"].to(device)
-                target     = batch["target"].to(device)
-                sigma      = batch["sigma"].to(device)
-                current_ps = int(batch["patch_size"][0].item())
-                output     = model(frames, sigma)
-                loss, _    = criterion(output, target)
-                lv         = loss.item()
-                sv         = _ssim(output, target)
-                val_l.append(lv)
-                val_s.append(sv)
-                scale_val_l[current_ps].append(lv)
-                scale_val_s[current_ps].append(sv)
-                # Garder un exemple par échelle pour la visualisation
-                if current_ps not in saved_by_scale:
-                    saved_by_scale[current_ps] = (frames.cpu(), output.cpu(), target.cpu())
+                frames = batch["frames"].to(device)
+                target = batch["target"].to(device)
+                sigma  = batch["sigma"].to(device)
+                output = model(frames, sigma)
+                loss, _ = criterion(output, target)
+                val_l.append(loss.item())
+                val_s.append(_ssim(output, target))
+                if saved is None:
+                    saved = (frames.cpu(), output.cpu(), target.cpu())
                 val_bar.set_postfix(
-                    loss = f"{lv:.4f}",
-                    ps   = current_ps,
+                    loss = f"{loss.item():.4f}",
                     avg  = f"{float(np.mean(val_l)):.4f}",
                 )
         val_bar.close()
@@ -729,37 +613,8 @@ def train(config_path: str, resume_path: str | None = None) -> None:
                 f"{epoch_s:.0f}s"
                 + (" ★ best" if is_best else "")
             )
-            # ── Détail par échelle (multi-scale uniquement) ────────────────
-            if ms_enabled and (scale_train_l or scale_val_l):
-                all_scales = sorted(set(list(scale_train_l) + list(scale_val_l)))
-                # Calculer les % en SAMPLES (batches × batch_size),
-                # pas en batches — sinon le 512 paraît sur-représenté à cause
-                # de ses petits batches (batch_size=2 vs 32 pour le 128).
-                total_samples_t = sum(
-                    len(v) * batch_sizes_map.get(s, t_cfg.get("batch_size", 8))
-                    for s, v in scale_train_l.items()
-                )
-                total_samples_t = max(total_samples_t, 1)
-                tqdm.write("  Détail par échelle :")
-                for s in all_scales:
-                    tl_vals  = scale_train_l.get(s, [])
-                    vl_vals  = scale_val_l.get(s, [])
-                    ts_vals  = scale_train_s.get(s, [])
-                    vs_vals  = scale_val_s.get(s, [])
-                    n_samp   = len(tl_vals) * batch_sizes_map.get(s, t_cfg.get("batch_size", 8))
-                    pct      = n_samp / total_samples_t * 100
-                    sl       = _safe_mean(tl_vals)
-                    ss       = _safe_mean(ts_vals)
-                    vl       = _safe_mean(vl_vals)
-                    vs       = _safe_mean(vs_vals)
-                    tqdm.write(
-                        f"    {s:3d}×{s:3d} ({pct:.0f}%) : "
-                        f"Train L1={sl:.5f}  SSIM={ss:.4f} | "
-                        f"Val  L1={vl:.5f}  SSIM={vs:.4f}"
-                    )
-            # ── Sauvegarde des exemples visuels par échelle ────────────────
-            for ps, saved_ps in saved_by_scale.items():
-                _save_samples(*saved_ps, epoch=epoch, out_dir=samples_dir, scale=ps)
+            if saved is not None:
+                _save_samples(*saved, epoch=epoch, out_dir=samples_dir)
 
         # ── Checkpoints ───────────────────────────────────────────────────
         state = dict(
@@ -778,76 +633,11 @@ def train(config_path: str, resume_path: str | None = None) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Entraînement FastDVDnet N2N pour vidéos vasculaires.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Exemples :\n"
-            "  python train.py\n"
-            "  python train.py --video-dirs MesDonnees/ AutreBanque/\n"
-            "  python train.py --video-dirs MesDonnees/ --mask MesDonnees/mask.png\n"
-            "  python train.py --epochs 50 --batch-size 4 --lr 5e-5\n"
-            "  python train.py --resume checkpoints/last.pth\n"
-        ),
-    )
-    parser.add_argument("--config",  default=str(SCRIPT_DIR / "config.yaml"),
-        help="Fichier de configuration YAML (défaut : config.yaml)")
-    parser.add_argument("--resume",  default=None,
-        help="Reprendre depuis un checkpoint (.pth)")
-
-    # Overrides — ces arguments écrasent les valeurs du config.yaml si fournis
-    parser.add_argument("--video-dirs", nargs="+", default=None,
-        help="Un ou plusieurs dossiers de vidéos d'entraînement "
-             "(relatifs à la racine du projet Stage/). "
-             "Écrase data.video_dirs dans config.yaml.")
-    parser.add_argument("--mask", default=None,
-        help="Chemin vers le masque .png "
-             "(relatif à Stage/). Écrase data.mask_path.")
-    parser.add_argument("--epochs", type=int, default=None,
-        help="Nombre d'epochs. Écrase training.epochs.")
-    parser.add_argument("--batch-size", type=int, default=None,
-        help="Taille de batch. Écrase training.batch_size.")
-    parser.add_argument("--lr", type=float, default=None,
-        help="Learning rate initial. Écrase training.lr.")
-    parser.add_argument("--checkpoint-dir", default=None,
-        help="Dossier de sauvegarde des checkpoints "
-             "(relatif à Stage/). Écrase training.checkpoint_dir.")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=str(SCRIPT_DIR / "config.yaml"))
+    parser.add_argument("--resume", default=None)
     args = parser.parse_args()
-
-    # Charger le config de base
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-
-    # Appliquer les overrides CLI
-    if args.video_dirs is not None:
-        cfg["data"]["video_dirs"] = args.video_dirs
-        log.info("Override video_dirs → %s", args.video_dirs)
-    if args.mask is not None:
-        cfg["data"]["mask_path"] = args.mask
-        log.info("Override mask_path  → %s", args.mask)
-    if args.epochs is not None:
-        cfg["training"]["epochs"] = args.epochs
-        log.info("Override epochs     → %d", args.epochs)
-    if args.batch_size is not None:
-        cfg["training"]["batch_size"] = args.batch_size
-        log.info("Override batch_size → %d", args.batch_size)
-    if args.lr is not None:
-        cfg["training"]["lr"] = args.lr
-        log.info("Override lr         → %g", args.lr)
-    if args.checkpoint_dir is not None:
-        cfg["training"]["checkpoint_dir"] = args.checkpoint_dir
-        log.info("Override ckpt_dir   → %s", args.checkpoint_dir)
-
-    # Écrire le config résultant dans un fichier temporaire et lancer
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
-        yaml.dump(cfg, tmp)
-        tmp_path = tmp.name
-    try:
-        train(tmp_path, args.resume)
-    finally:
-        os.unlink(tmp_path)
+    train(args.config, args.resume)
 
 
 if __name__ == "__main__":
