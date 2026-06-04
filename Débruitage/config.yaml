@@ -79,6 +79,13 @@ training:
   oscillation_min_epoch:     40      # pas d'alerte avant cette epoch
   stagnation_patience:       15      # alerte si pas d'amélioration pendant N epochs
 
+sr:
+  scale_factor:    2       # output resolution = input × scale_factor  (512→1024)
+  drop_size:       0.7     # drizzle kernel size in HR pixels (0.5=sharp, 1.0=mean)
+  upsample_factor: 100     # sub-pixel precision = 1/upsample_factor px
+  n_frames_max:    null    # null = use all valid frames
+  min_frames:      20      # abort if fewer valid frames remain
+
 inference:
   checkpoint: "Débruitage/checkpoints/best_model.pth"
   output_dir: "Débruitage/denoised"
