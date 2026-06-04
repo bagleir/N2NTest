@@ -83,8 +83,7 @@ def _ssim_tensor(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     Toujours float32, toujours borné → ne peut pas causer de NaN.
     """
     # Forcer float32 même sous autocast float16
-    # NOTE: ne PAS appeler .detach() ici — couperait silencieusement le gradient SSIM
-    pred   = pred.float()
+    pred   = pred.detach().float() if not pred.requires_grad else pred.float()
     target = target.float()
     # Clamp entrées dans [0, 1] pour stabilité numérique
     pred   = pred.clamp(0, 1)
@@ -140,7 +139,7 @@ class N2NLoss(nn.Module):
         self,
         w_l1:                float = 0.70,
         w_ssim:              float = 0.30,
-        w_gradient:          float = 0.20,   # valeur par défaut alignée sur config
+        w_gradient:          float = 0.20,
         lambda_temporal:     float = 0.10,
         lambda_pulsation:    float = 0.05,
         pulsation_threshold: float = 0.70,
@@ -392,32 +391,7 @@ def train(config_path: str, resume_path: str | None = None) -> None:
 
     model     = FastDVDnet(features=cfg["model"]["features"]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=t_cfg["lr"])
-
-    # ── Scheduler : warmup linéaire → cosine annealing ────────────────────
-    # Phase 1 (warmup_epochs) : LR monte linéairement de lr/10 → lr
-    # Phase 2 (reste)          : CosineAnnealingLR de lr → ~0
-    # Justification : LR agressive (4e-4) avec batch=64 nécessite un warmup
-    # pour stabiliser les premiers gradients (patchs 192px, features=96).
-    warmup_epochs = t_cfg.get("warmup_epochs", 8)
-    cosine_epochs = t_cfg["epochs"] - warmup_epochs
-    warmup_sched  = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor = 0.1,          # démarre à lr × 0.1
-        end_factor   = 1.0,          # atteint lr à la fin du warmup
-        total_iters  = warmup_epochs,
-    )
-    cosine_sched  = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cosine_epochs,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers   = [warmup_sched, cosine_sched],
-        milestones   = [warmup_epochs],
-    )
-    log.info(
-        "Scheduler : warmup linéaire %d epochs → cosine %d epochs (lr_max=%.1e)",
-        warmup_epochs, cosine_epochs, t_cfg["lr"],
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_cfg["epochs"])
     criterion = N2NLoss(
         w_l1                = t_cfg.get("w_l1",             0.70),
         w_ssim              = t_cfg.get("w_ssim",           0.30),
