@@ -10,9 +10,9 @@ Cas générés (tous avec masque) :
   3. Après prétraitement + USM               → frame FRAME
   4. Prétraitement → upscale → projection
   5. Upscale + USM → projection
-  6. N2N (sur upscalé 1024×1024) → USM → projection              [checkpoint requis]
-  7. N2N (sur USM upscalé 1024×1024) → USM → projection          [checkpoint requis]
-     └─ USM appliqué AVANT N2N (cas 7) + USM post-N2N dans les deux cas.
+  6. N2N (sur upscalé 1024×1024) → projection              [checkpoint requis]
+  7. N2N (sur USM upscalé 1024×1024) → projection          [checkpoint requis]
+     └─ USM appliqué AVANT N2N dans le cas 7.
  10. N2N (512) → upscale → USM → projection                [checkpoint requis]
  11. N2N (512) → upscale → CLAHE + USM → projection        [checkpoint requis]
      └─ Cas 10/11 : N2N sur la vidéo prétraitée 512, upscale 1024,
@@ -416,46 +416,34 @@ def run_comparison(
     else:
         print(f"  Checkpoint : {ckpt}")
 
-        # ── Cas 6 : N2N (sur upscaled 1024) → USM → projection ─────────────
+        # ── Cas 6 : N2N (sur upscaled 1024) → projection ────────────────────
         # mask_up_path = masque 1024×1024 : évite l'erreur de forme dans inference.py
-        _step("Cas 6 — N2N sur upscalé + USM + projection")
-        p_n2n_pre     = vdir / "n2n_upscaled.avi"
-        p_n2n_pre_usm = vdir / "n2n_upscaled_usm.avi"
+        _step("Cas 6 — N2N sur upscalé + projection")
+        p_n2n_pre = vdir / "n2n_upscaled.avi"
         ok = True
         if not p_n2n_pre.exists():
             ok = _run_n2n(p_upscaled, p_n2n_pre, ckpt, sdir, mask_path=mask_up_path)
         else:
             print(f"  Cache trouvé : {p_n2n_pre.name}")
         if ok and p_n2n_pre.exists():
-            if not p_n2n_pre_usm.exists():
-                apply_usm_video(str(p_n2n_pre), str(p_n2n_pre_usm), sigma=sigma, strength=strength)
-            else:
-                print(f"  Cache trouvé : {p_n2n_pre_usm.name}")
-            projs6 = compute_projections(str(p_n2n_pre_usm), mask_up, str(out / "cas_06_n2n_upscaled"))
+            projs6 = compute_projections(str(p_n2n_pre), mask_up, str(out / "cas_06_n2n_upscaled"))
             img, crop = _save_case(projs6[PROJ_KEY], out / "cas_06_n2n_upscaled",
                                    f"projection_{PROJ_KEY}", crop_size)
-            case_data[6] = ("6. N2N (upsc.)\n→ USM → Proj.", img, crop)
+            case_data[6] = ("6. N2N (upscalé)\n+ Projection", img, crop)
 
-        # ── Cas 7 : N2N (sur USM upscalé 1024) → USM → projection ──────────
-        # USM pré-N2N (via p_usm) est conservé — distingue le cas 7 du cas 6.
-        # USM post-N2N ajouté pour bénéficier de la synergie USM × projection.
-        _step("Cas 7 — N2N sur USM upscalé + USM + projection")
-        p_n2n_usm      = vdir / "n2n_usm.avi"
-        p_n2n_usm_post = vdir / "n2n_usm_post.avi"
+        # ── Cas 7 : N2N (sur USM upscalé 1024) → projection ─────────────────
+        _step("Cas 7 — N2N sur USM upscalé + projection")
+        p_n2n_usm = vdir / "n2n_usm.avi"
         ok = True
         if not p_n2n_usm.exists():
             ok = _run_n2n(p_usm, p_n2n_usm, ckpt, sdir, mask_path=mask_up_path)
         else:
             print(f"  Cache trouvé : {p_n2n_usm.name}")
         if ok and p_n2n_usm.exists():
-            if not p_n2n_usm_post.exists():
-                apply_usm_video(str(p_n2n_usm), str(p_n2n_usm_post), sigma=sigma, strength=strength)
-            else:
-                print(f"  Cache trouvé : {p_n2n_usm_post.name}")
-            projs7 = compute_projections(str(p_n2n_usm_post), mask_up, str(out / "cas_07_n2n_usm"))
+            projs7 = compute_projections(str(p_n2n_usm), mask_up, str(out / "cas_07_n2n_usm"))
             img, crop = _save_case(projs7[PROJ_KEY], out / "cas_07_n2n_usm",
                                    f"projection_{PROJ_KEY}", crop_size)
-            case_data[7] = ("7. USM→N2N→USM\n→ Proj.", img, crop)
+            case_data[7] = ("7. N2N (USM upscalé)\n+ Projection", img, crop)
 
         # ── Cas 10 & 11 : N2N 512 → post-traitement → upscale → projection ────
         # Les deux cas partagent le même résultat N2N sur la vidéo prétraitée 512.
@@ -541,7 +529,7 @@ def run_comparison(
     _make_grid(
         [2, 5, 7, 6, 10, 11],
         out / "comparison_grid_n2n.png",
-        "N2N — 2 Prétraité  |  5 USM+Proj  |  7 USM→N2N→USM  |  6 N2N→USM  |  10 N2N→upsc→USM  |  11 N2N→upsc→CLAHE+USM",
+        "N2N — 2 Prétraité  |  5 USM+Proj  |  7 N2N(USM→)  |  6 N2N(upsc)  |  10 N2N→upsc→USM  |  11 N2N→upsc→CLAHE+USM",
     )
 
     elapsed = time.perf_counter() - t0
