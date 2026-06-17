@@ -179,6 +179,64 @@ def temporal_denoise_stack(stack: np.ndarray, win: int = 9,
 # =====================================================================
 # 4. PROJECTION TEMPORELLE
 # =====================================================================
+def drizzle_projection(stack: np.ndarray, scale: int = 2,
+                       ref_index: int | None = None,
+                       upsample_factor: int = 20,
+                       reducer: str = "mean", percentile: float = 90.0,
+                       interp: int = cv2.INTER_LANCZOS4) -> np.ndarray:
+    """Super-résolution multi-frames (drizzle / shift-and-add simplifié).
+
+    Estime le décalage SOUS-PIXEL de chaque frame (corrélation de phase),
+    re-échantillonne chaque frame UNE SEULE FOIS sur une grille scale× plus
+    fine en corrigeant ce décalage, puis accumule. La diversité d'échantillonnage
+    sous-pixel entre frames permet de récupérer du détail réel au-delà d'un
+    simple upscale Lanczos (interpolation pure).
+
+    Translation uniquement (hypothèse drizzle classique) : à utiliser de
+    préférence sur la pile BRUTE (un seul ré-échantillonnage). Si rotation/torsion
+    importante, faire un recalage euclidien d'abord (au prix d'un ré-échantillonnage
+    supplémentaire).
+
+    reducer='mean' (peu de mémoire), 'percentile' ou 'max' (stocke toutes les
+    frames haute-réso -> ~1 Go pour 283 frames en 1024²).
+    """
+    from skimage.registration import phase_cross_correlation
+    T, H, W = stack.shape
+    fy, fx = H * scale, W * scale
+    ref = (stack.mean(0) if ref_index is None else stack[ref_index]).astype(np.float32)
+
+    if reducer == "mean":
+        acc = np.zeros((fy, fx), np.float64)
+        wsum = 0.0
+    else:
+        frames_hi = np.empty((T, fy, fx), np.float32)
+
+    for t in tqdm(range(T), desc=f"Drizzle x{scale} ({reducer})"):
+        f = stack[t].astype(np.float32)
+        shift, _, _ = phase_cross_correlation(ref, f, upsample_factor=upsample_factor,
+                                              normalization=None)
+        dy, dx = float(shift[0]), float(shift[1])
+        # mappe src(natif) -> dst(fin) : dst = scale*(src + décalage)
+        M = np.array([[scale, 0, scale * dx],
+                      [0, scale, scale * dy]], np.float32)
+        hi = cv2.warpAffine(f, M, (fx, fy), flags=interp,
+                            borderMode=cv2.BORDER_REFLECT)
+        if reducer == "mean":
+            acc += hi
+            wsum += 1.0
+        else:
+            frames_hi[t] = hi
+
+    if reducer == "mean":
+        out = (acc / max(wsum, 1e-6)).astype(np.float32)
+    elif reducer == "percentile":
+        out = np.percentile(frames_hi, percentile, axis=0).astype(np.float32)
+    else:  # max
+        out = frames_hi.max(axis=0).astype(np.float32)
+    return np.clip(out, 0, 1)
+
+
+
 def project(stack: np.ndarray, method: str = "percentile",
             percentile: float = 90.0,
             target_size: int | None = None) -> np.ndarray:
@@ -409,12 +467,7 @@ def run_pipeline(video_path: str, out_dir: str, cfg: dict):
             import n2n
         except ImportError:
             raise SystemExit("n2n.py introuvable ou PyTorch non installé.")
-        
-        # Chemin pour la vidéo débruitee
-        n2n_video_path = None
-        if cfg.get("save_n2n_video", False):
-            n2n_video_path = os.path.join(out_dir, f"{name}_denoised_n2n.avi")
-        
+
         stack = n2n.denoise_stack_n2n(
             stack,
             epochs=cfg.get("n2n_epochs", 200),
@@ -426,12 +479,17 @@ def run_pipeline(video_path: str, out_dir: str, cfg: dict):
             device=cfg.get("device", "cuda"),
             pretrained=cfg.get("n2n_pretrained"),
             model_out=os.path.join(out_dir, f"{name}_n2n.pt"),
-            save_video=cfg.get("save_n2n_video", False),
-            video_path=n2n_video_path
+            save_video=False  # on sauve APRÈS le VST inverse (intensités correctes)
         )
 
     if nm is not None:
         stack = np.clip(nm.inverse(stack * (_norm[1] - _norm[0]) + _norm[0]), 0, 1)
+
+    # Vidéo débruitée N2N, dans le domaine image d'origine (après VST inverse)
+    if denoiser == "n2n" and cfg.get("save_n2n_video", True):
+        n2n_video_path = os.path.join(out_dir, f"{name}_denoised_n2n.avi")
+        save_video_gray(n2n_video_path, stack)
+        print(f"  [N2N] Vidéo débruitée sauvegardée : {n2n_video_path}")
 
     if cfg.get("save_stack", False):
         save_video_gray(os.path.join(out_dir, f"{name}_clean_stack.avi"), stack)
@@ -444,6 +502,12 @@ def run_pipeline(video_path: str, out_dir: str, cfg: dict):
                                    usm_sigma=cfg.get("usm_sigma", 2.0),
                                    usm_amount=cfg.get("usm_amount_proj", 1.0),
                                    usm_when=cfg.get("usm_when", "post"))
+    elif pmethod == "drizzle":
+        scale = max(1, cfg.get("target_size", 1024) // stack.shape[1])
+        proj = drizzle_projection(stack, scale=scale,
+                                  reducer=cfg.get("drizzle_reducer", "mean"),
+                                  percentile=cfg.get("percentile", 90.0),
+                                  upsample_factor=cfg.get("drizzle_upsample", 20))
     else:
         # mean / percentile / mip|max : upscalés à target_size par project()
         proj = project(stack, pmethod, cfg.get("percentile", 90.0),
@@ -505,7 +569,7 @@ def _build_cli():
     p.add_argument("video")
     p.add_argument("-o", "--out", default="out_pipeline")
     p.add_argument("--denoiser", choices=["temporal", "n2n", "none"], default="temporal")
-    p.add_argument("--projection", choices=["usm_mean", "mip", "mean", "percentile"],
+    p.add_argument("--projection", choices=["usm_mean", "mip", "mean", "percentile", "drizzle"],
                    default="percentile")
     p.add_argument("--enhance", choices=["soft", "light", "full", "none"], default="soft")
     p.add_argument("--no-register", action="store_true")
@@ -517,8 +581,10 @@ def _build_cli():
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--device", default="cuda")
     p.add_argument("--model", default=None, help="modèle N2N pré-entraîné")
-    p.add_argument("--save-n2n-video", action="store_true",
-                   help="Sauvegarde la vidéo débruitee par N2N")
+    p.add_argument("--save-n2n-video", dest="save_n2n_video", action="store_true",
+                   default=True, help="Sauvegarde la vidéo débruitée par N2N (défaut: oui)")
+    p.add_argument("--no-save-n2n-video", dest="save_n2n_video", action="store_false",
+                   help="Ne pas sauvegarder la vidéo débruitée N2N")
     return p
 
 

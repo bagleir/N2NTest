@@ -463,7 +463,13 @@ def denoise_stack_n2n(stack: np.ndarray, epochs: int = 200,
     # Chargement pré-entraîné
     if pretrained and os.path.exists(pretrained):
         model = UNet(in_ch=n_input_frames, base=64, depth=4).to(device)
-        model.load_state_dict(torch.load(pretrained, map_location=device))
+        try:
+            model.load_state_dict(torch.load(pretrained, map_location=device))
+        except RuntimeError as e:
+            raise SystemExit(
+                f"  [N2N] Impossible de charger {pretrained} : architecture "
+                f"incompatible.\n  -> Un modèle entraîné AVANT le passage "
+                f"BatchNorm->GroupNorm doit être ré-entraîné.\n  Détail : {e}")
         print(f"  [N2N] Modèle pré-entraîné : {pretrained}")
         result = _infer(model, stack, offsets, device)
         if save_video and video_path:
