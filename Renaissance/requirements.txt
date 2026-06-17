@@ -1,0 +1,12 @@
+# Dépendances de la pipeline de débruitage / rehaussement vasculaire
+numpy>=1.23
+opencv-python>=4.7        # IO vidéo, ECC, flux optique, CLAHE, morphologie
+scikit-image>=0.21        # Frangi, rolling-ball, NLM, unsharp_mask, morphologie
+scipy>=1.10               # filtres, optimisation
+tqdm>=4.65                # barres de progression
+
+# --- Optionnel : route Deep Learning (Noise2Noise / Neighbor2Neighbor) ---
+# torch>=2.0              # décommenter pour la route N2N (GPU recommandé)
+
+# --- Optionnel : débruitage spatial de référence ---
+# bm3d>=4.0               # BM3D (alternative/complément au NLM)
