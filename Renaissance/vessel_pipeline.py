@@ -179,15 +179,38 @@ def temporal_denoise_stack(stack: np.ndarray, win: int = 9,
 # =====================================================================
 # 4. PROJECTION TEMPORELLE
 # =====================================================================
-def project(stack: np.ndarray, method: str = "mip",
-            percentile: float = 90.0) -> np.ndarray:
-    if method == "mip":
-        return stack.max(axis=0)
-    if method == "mean":
-        return stack.mean(axis=0)
-    if method == "percentile":
-        return np.percentile(stack, percentile, axis=0)
-    raise ValueError(method)
+def project(stack: np.ndarray, method: str = "percentile",
+            percentile: float = 90.0,
+            target_size: int | None = None) -> np.ndarray:
+    """Projection temporelle, avec upscale Lanczos optionnel.
+
+    La réduction temporelle est faite à la résolution native (rapide, peu de
+    mémoire), PUIS la projection est agrandie à target_size. Pour mean/percentile
+    c'est équivalent (à l'interpolation près) à upscaler chaque frame d'abord,
+    pour un coût bien moindre.
+
+    method :
+      'mean'       : moyenne (déjà fait par d'autres recettes).
+      'percentile' : percentile p par pixel (def. p=90). Robuste à la saturation
+                     transitoire du bolus et fait ressortir plus de vaisseaux
+                     fins que la moyenne, sans l'explosion de bruit du max.
+      'mip'/'max'  : max temporel (contraste maximal mais bruit non moyenné ->
+                     à réserver à une pile déjà débruitée, p.ex. après N2N).
+    """
+    if method in ("mip", "max"):
+        proj = stack.max(axis=0)
+    elif method == "mean":
+        proj = stack.mean(axis=0)
+    elif method == "percentile":
+        proj = np.percentile(stack, percentile, axis=0)
+    else:
+        raise ValueError(method)
+
+    proj = proj.astype(np.float32)
+    if target_size and proj.shape[0] != target_size:
+        proj = cv2.resize(proj, (target_size, target_size),
+                          interpolation=cv2.INTER_LANCZOS4)
+    return np.clip(proj, 0, 1)
 
 
 def usm_mean_projection(stack: np.ndarray, target_size: int = 1024,
@@ -414,7 +437,7 @@ def run_pipeline(video_path: str, out_dir: str, cfg: dict):
         save_video_gray(os.path.join(out_dir, f"{name}_clean_stack.avi"), stack)
 
     # 4. Projection
-    pmethod = cfg.get("projection", "usm_mean")
+    pmethod = cfg.get("projection", "percentile")
     print(f"[4] Projection : {pmethod}")
     if pmethod == "usm_mean":
         proj = usm_mean_projection(stack, target_size=cfg.get("target_size", 1024),
@@ -422,7 +445,9 @@ def run_pipeline(video_path: str, out_dir: str, cfg: dict):
                                    usm_amount=cfg.get("usm_amount_proj", 1.0),
                                    usm_when=cfg.get("usm_when", "post"))
     else:
-        proj = np.clip(project(stack, pmethod, cfg.get("percentile", 90.0)), 0, 1)
+        # mean / percentile / mip|max : upscalés à target_size par project()
+        proj = project(stack, pmethod, cfg.get("percentile", 90.0),
+                       target_size=cfg.get("target_size", 1024))
     save_image(os.path.join(out_dir, f"{name}_projection.png"), proj, bits=16)
     # moyenne native 512 (référence de comparaison)
     save_image(os.path.join(out_dir, f"{name}_mean512.png"), np.clip(stack.mean(0), 0, 1))
@@ -461,11 +486,15 @@ DEFAULT_CFG = dict(
     save_n2n_video=False,  # NOUVEAU: sauvegarder la vidéo débruitee
     
     device="cuda",
-    projection="usm_mean",
+    # Projection par défaut : percentile (amélioration 2). Recalage actif
+    # (amélioration 1, étape [2]) -> la projection bénéficie de frames recalées.
+    projection="percentile",
     target_size=1024, usm_sigma=2.0, usm_amount_proj=1.0, usm_when="post", percentile=90.0,
     save_stack=False,
+    # frangi_sigmas mis à l'échelle 1024 (amélioration 3) : à 1024 les vaisseaux
+    # sont ~2x plus larges qu'à 512, donc (2,4,6) au lieu de (1,2,3).
     enhance=dict(profile="soft", nlm_h=0.8, frangi_blend=0.30,
-                 clahe_clip=1.5, clahe_grid=32, frangi_sigmas=(1, 2, 3),
+                 clahe_clip=1.5, clahe_grid=32, frangi_sigmas=(2, 4, 6),
                  usm_radius=2.0, usm_amount=1.2, gamma=0.85,
                  ff_method="tophat", ff_radius=60),
 )
@@ -477,7 +506,7 @@ def _build_cli():
     p.add_argument("-o", "--out", default="out_pipeline")
     p.add_argument("--denoiser", choices=["temporal", "n2n", "none"], default="temporal")
     p.add_argument("--projection", choices=["usm_mean", "mip", "mean", "percentile"],
-                   default="usm_mean")
+                   default="percentile")
     p.add_argument("--enhance", choices=["soft", "light", "full", "none"], default="soft")
     p.add_argument("--no-register", action="store_true")
     p.add_argument("--optical-flow", action="store_true")
