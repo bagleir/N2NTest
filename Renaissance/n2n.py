@@ -16,6 +16,7 @@ import os
 import glob
 import json
 import numpy as np
+import cv2
 from tqdm import tqdm
 
 import torch
@@ -167,6 +168,106 @@ def build_brightness_pairs(stack: np.ndarray, min_pair_distance: int = 8,
 def _consecutive_pairs(T: int, gap: int = 1) -> np.ndarray:
     idx = np.arange(0, T - gap)
     return np.stack([idx, idx + gap], axis=1).astype(np.int32)
+
+
+def build_cardiac_phase_pairs(stack: np.ndarray,
+                              min_period: int = 20, max_period: int = 140,
+                              topk: int = 6, refine: bool = True,
+                              max_cycle_distance: int | None = None) -> np.ndarray:
+    """Apparie les frames par PHASE CARDIAQUE (adapté au LDH / M0 power Doppler).
+
+    Principe (cf. littérature LDH) : en holographie Doppler la M0 pulse au
+    rythme cardiaque. Deux frames à la MÊME phase cardiaque mais dans des cycles
+    DIFFÉRENTS correspondent au même état de flux latent, tandis que le bruit
+    résiduel est ~indépendant -> ce sont deux observations bruitées de la même
+    image (hypothèse N2N correcte), contrairement à l'appariement par luminosité
+    globale qui n'est qu'un proxy grossier.
+
+    Étapes : (1) signal de pouls = M0 moyennée spatialement par frame ;
+    (2) détection de la période cardiaque dominante par FFT (en frames, sans
+    besoin du fps) ; (3) phase instantanée par transformée de Hilbert ;
+    (4) pour chaque frame i, on cherche les frames à phase proche dans un AUTRE
+    cycle (distance temporelle >= ~½ période), puis on raffine par corrélation
+    croisée normalisée (NCC) pour écarter les candidats mal alignés.
+
+    Repli automatique sur build_brightness_pairs si aucun rythme net n'est trouvé.
+    """
+    try:
+        from scipy.signal import hilbert
+    except ImportError:
+        return build_brightness_pairs(stack)
+
+    T = stack.shape[0]
+    if T < max(3 * min_period, 30):
+        return build_brightness_pairs(stack)
+
+    # (1) signal de pouls + détrend
+    sig = stack.reshape(T, -1).mean(axis=1).astype(np.float64)
+    win = min(max_period, T)
+    trend = np.convolve(sig, np.ones(win) / win, mode="same")
+    s = sig - trend
+    s -= s.mean()
+
+    # (2) période dominante par FFT, restreinte à [min_period, max_period]
+    spec = np.abs(np.fft.rfft(s * np.hanning(T)))
+    freqs = np.fft.rfftfreq(T)  # cycles/frame
+    band = (freqs >= 1.0 / max_period) & (freqs <= 1.0 / min_period)
+    if not band.any() or spec[band].max() <= 0:
+        return build_brightness_pairs(stack)
+    f0 = freqs[band][np.argmax(spec[band])]
+    period = 1.0 / f0
+    # critère de "rythme net" : pic spectral nettement au-dessus du fond
+    if spec[band].max() < 3.0 * np.median(spec[freqs > 0] + 1e-12):
+        print("  [N2N] Pas de rythme cardiaque net -> repli luminosité.")
+        return build_brightness_pairs(stack)
+    print(f"  [N2N] Période cardiaque détectée : {period:.1f} frames "
+          f"(~{T / period:.1f} cycles).")
+
+    # (3) phase instantanée (Hilbert sur le signal bande étroite autour de f0)
+    F = np.fft.rfft(s)
+    mask = (freqs > 0.5 * f0) & (freqs < 1.6 * f0)
+    F_bp = np.where(mask, F, 0)
+    s_bp = np.fft.irfft(F_bp, n=T)
+    phase = np.angle(hilbert(s_bp))  # [-pi, pi]
+
+    min_cycle_distance = int(round(0.5 * period))
+    if max_cycle_distance is None:
+        max_cycle_distance = int(round(3.0 * period))
+
+    # NCC sur frames sous-échantillonnées (rapide) pour le raffinement
+    if refine:
+        small = np.stack([cv2.resize(stack[t], (64, 64),
+                                     interpolation=cv2.INTER_AREA) for t in range(T)])
+        small = (small - small.mean(axis=(1, 2), keepdims=True))
+        norm = np.sqrt((small ** 2).sum(axis=(1, 2))) + 1e-8
+
+    idx = np.arange(T)
+    pairs = []
+    for i in range(T):
+        dt = np.abs(idx - i)
+        valid = (dt >= min_cycle_distance) & (dt <= max_cycle_distance)
+        if not valid.any():
+            continue
+        # distance de phase circulaire
+        dphase = np.abs(np.angle(np.exp(1j * (phase - phase[i]))))
+        dphase[~valid] = np.inf
+        cand = np.argsort(dphase)[:topk]
+        cand = cand[np.isfinite(dphase[cand])]
+        if len(cand) == 0:
+            continue
+        if refine:
+            ncc = (small[cand] * small[i]).sum(axis=(1, 2)) / (norm[cand] * norm[i])
+            best = int(cand[int(np.argmax(ncc))])
+        else:
+            best = int(cand[0])
+        pairs.append((i, best))
+
+    if not pairs:
+        return build_brightness_pairs(stack)
+    pairs = np.array(pairs, dtype=np.int32)
+    np.random.shuffle(pairs)
+    return pairs
+
 
 
 def vesselness_map(stack: np.ndarray) -> np.ndarray:
@@ -478,7 +579,9 @@ def denoise_stack_n2n(stack: np.ndarray, epochs: int = 200,
     
     # Construction des paires
     print(f"\n[N2N] Construction des paires...")
-    if pairing == "brightness":
+    if pairing == "cardiac":
+        pairs = build_cardiac_phase_pairs(stack)
+    elif pairing == "brightness":
         pairs = build_brightness_pairs(stack, min_pair_distance, max_pair_distance)
     else:
         pairs = _consecutive_pairs(stack.shape[0], gap=1)
@@ -541,13 +644,15 @@ def _save_denoised_video(stack: np.ndarray, video_path: str):
 
 def preprocess_for_n2n(video_path, cache_dir, motion="euclidean",
                        optical_flow=False, min_pair_distance=8,
-                       max_pair_distance=50, max_frames=None) -> dict:
+                       max_pair_distance=50, max_frames=None,
+                       pairing="brightness") -> dict:
     import vessel_pipeline as vp
     
     os.makedirs(cache_dir, exist_ok=True)
     name = os.path.splitext(os.path.basename(video_path))[0]
     sp = os.path.join(cache_dir, f"{name}_stack.npy")
-    pp = os.path.join(cache_dir, f"{name}_pairs.npy")
+    # les paires dépendent de la stratégie -> suffixe pour ne pas mélanger les caches
+    pp = os.path.join(cache_dir, f"{name}_pairs_{pairing}.npy")
     vp_ = os.path.join(cache_dir, f"{name}_ves.npy")
     
     if os.path.exists(sp) and os.path.exists(pp) and os.path.exists(vp_):
@@ -562,9 +667,16 @@ def preprocess_for_n2n(video_path, cache_dir, motion="euclidean",
     stack = ((stack - vlo) / (vhi - vlo + 1e-6)).astype(np.float32)
     stack = np.clip(stack, 0, 1)
     stack, _ = vp.register_stack(stack, motion=motion, optical_flow=optical_flow)
-    
+
+    if pairing == "cardiac":
+        pairs = build_cardiac_phase_pairs(stack)
+    elif pairing == "consecutive":
+        pairs = _consecutive_pairs(stack.shape[0], gap=1)
+    else:
+        pairs = build_brightness_pairs(stack, min_pair_distance, max_pair_distance)
+
     np.save(sp, stack.astype(np.float32))
-    np.save(pp, build_brightness_pairs(stack, min_pair_distance, max_pair_distance))
+    np.save(pp, pairs)
     np.save(vp_, vesselness_map(stack))
     
     return {"stack": sp, "pairs": pp, "ves": vp_}
@@ -574,7 +686,8 @@ def train_n2n_folder(folder, model_out, cache_dir=None, glob_pattern="*.avi",
                      epochs=300, patch=128, lr=1e-4, batch=16, device="cuda",
                      n_input_frames=5, motion="euclidean", optical_flow=False,
                      min_pair_distance=8, max_pair_distance=50,
-                     samples_per_epoch=4000, max_frames=None) -> str:
+                     samples_per_epoch=4000, max_frames=None,
+                     pairing="brightness") -> str:
     """Entraîne N2N sur un dossier de vidéos."""
     
     device = device if torch.cuda.is_available() else "cpu"
@@ -584,7 +697,7 @@ def train_n2n_folder(folder, model_out, cache_dir=None, glob_pattern="*.avi",
     if not videos:
         raise FileNotFoundError(f"Aucune vidéo {glob_pattern} dans {folder}")
     
-    print(f"\n[N2N-dossier] {len(videos)} vidéos trouvées")
+    print(f"\n[N2N-dossier] {len(videos)} vidéos trouvées (pairing={pairing})")
     print(f"[N2N-dossier] Cache: {cache_dir}")
     
     stacks, pairs, vess = [], [], []
@@ -594,7 +707,7 @@ def train_n2n_folder(folder, model_out, cache_dir=None, glob_pattern="*.avi",
                                       optical_flow=optical_flow,
                                       min_pair_distance=min_pair_distance,
                                       max_pair_distance=max_pair_distance,
-                                      max_frames=max_frames)
+                                      max_frames=max_frames, pairing=pairing)
             stacks.append(np.load(info["stack"], mmap_mode="r"))
             pairs.append(np.load(info["pairs"]))
             vess.append(np.load(info["ves"]))
@@ -645,6 +758,9 @@ if __name__ == "__main__":
     pt.add_argument("--optical-flow", action="store_true")
     pt.add_argument("--max-frames", type=int, default=None)
     pt.add_argument("--min-distance", type=int, default=8)
+    pt.add_argument("--pairing", default="brightness",
+                    choices=["brightness", "cardiac", "consecutive"],
+                    help="cardiac = appariement par phase cardiaque (recommandé pour LDH)")
     pt.add_argument("--device", default="cuda")
     
     pd = sub.add_parser("denoise")
@@ -652,7 +768,8 @@ if __name__ == "__main__":
     pd.add_argument("-m", "--model", default=None)
     pd.add_argument("--epochs", type=int, default=150)
     pd.add_argument("--frames", type=int, default=5)
-    pd.add_argument("--pairing", default="brightness", choices=["brightness", "consecutive"])
+    pd.add_argument("--pairing", default="brightness",
+                    choices=["brightness", "cardiac", "consecutive"])
     pd.add_argument("--min-distance", type=int, default=8)
     pd.add_argument("--device", default="cuda")
     pd.add_argument("--save-video", action="store_true", 
@@ -673,6 +790,7 @@ if __name__ == "__main__":
             optical_flow=a.optical_flow,
             max_frames=a.max_frames,
             min_pair_distance=a.min_distance,
+            pairing=a.pairing,
             device=a.device
         )
     else:
