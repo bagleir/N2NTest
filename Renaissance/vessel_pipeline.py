@@ -246,9 +246,17 @@ def flat_field(img: np.ndarray, method: str = "tophat", radius: int = 60) -> np.
 
 def apply_clahe(img: np.ndarray, clip: float = 2.5, grid: int = 8,
                 normalize: bool = True) -> np.ndarray:
+    # IMPORTANT : CLAHE en 8 bits (comme le projet de référence "cas F").
+    # En 16 bits, le clipLimit d'OpenCV est relatif à 65536 bins : l'histogramme
+    # par tuile devient ultra-clairsemé, l'écrêtage n'agit plus, et CLAHE fait
+    # une égalisation locale quasi totale -> explosion du bruit de fond, aspect
+    # "embossé", contours de tuiles. Le 8 bits peuple l'histogramme et garde un
+    # rehaussement doux. (Pour rester en 16 bits il faudrait multiplier clip
+    # par ~256.)
     base = _normalize(img) if normalize else np.clip(img, 0, 1)
-    u16 = (base * 65535).astype(np.uint16)
-    return cv2.createCLAHE(clipLimit=clip, tileGridSize=(grid, grid)).apply(u16).astype(np.float32) / 65535.0
+    u8 = (base * 255.0 + 0.5).astype(np.uint8)
+    out = cv2.createCLAHE(clipLimit=clip, tileGridSize=(grid, grid)).apply(u8)
+    return out.astype(np.float32) / 255.0
 
 
 def estimate_sigma_mad(img: np.ndarray) -> float:

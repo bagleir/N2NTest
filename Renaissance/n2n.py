@@ -27,18 +27,44 @@ from skimage.filters import frangi
 
 
 # =====================================================================
+# REPRODUCTIBILITÉ
+# =====================================================================
+
+def seed_everything(seed: int = 1234):
+    """Fixe les graines pour numpy/torch (reproductibilité des ablations)."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _worker_init_fn(worker_id: int):
+    """Re-seed numpy DANS chaque worker DataLoader.
+
+    Sinon, après le fork, tous les workers héritent du même état RNG global
+    et tirent les MÊMES patchs -> diversité réduite / patchs dupliqués.
+    """
+    base = torch.initial_seed() % (2 ** 31 - 1)
+    np.random.seed((base + worker_id) % (2 ** 31 - 1))
+
+
+# =====================================================================
 # MODÈLE : U-Net résiduel (base=64, depth=4)
 # =====================================================================
 
 class _DoubleConv(nn.Module):
     def __init__(self, cin, cout):
         super().__init__()
+        # GroupNorm au lieu de BatchNorm : en débruitage la BN couple les
+        # échantillons du batch (patchs de luminosités très différentes ici) et
+        # crée un écart train/eval via ses stats courantes -> artefacts.
+        ng = max(1, min(8, cout // 8))
         self.net = nn.Sequential(
             nn.Conv2d(cin, cout, 3, padding=1),
-            nn.BatchNorm2d(cout),
+            nn.GroupNorm(ng, cout),
             nn.LeakyReLU(0.1, True),
             nn.Conv2d(cout, cout, 3, padding=1),
-            nn.BatchNorm2d(cout),
+            nn.GroupNorm(ng, cout),
             nn.LeakyReLU(0.1, True)
         )
 
@@ -274,92 +300,138 @@ def _infer(model, stack, offsets, device, pad_mult=8):
 # ENTRAÎNEMENT AVEC BARRE DE PROGRESSION PROPRE
 # =====================================================================
 
-def _train(model, ds, val_ref, device, epochs, lr, batch):
-    dl = DataLoader(ds, batch_size=batch, shuffle=True, 
-                    num_workers=2, drop_last=True)
-    
+def _build_val_batch(ds, n_items=64, seed=4321):
+    """Construit un lot de validation FIXE et déterministe.
+
+    Note : c'est un proxy de monitoring (mêmes vidéos, patchs différents tirés
+    une fois pour toutes). Il permet l'early-stopping et le suivi du
+    sur-lissage, mais ce n'est pas un held-out strict (frames non exclues du
+    train). Pour un held-out propre, réserver des frames entières.
+    """
+    rng_state = np.random.get_state()
+    np.random.seed(seed)
+    items = [ds[i] for i in range(n_items)]
+    np.random.set_state(rng_state)
+    inp = torch.stack([it[0] for it in items])
+    target = torch.stack([it[1] for it in items])
+    center = torch.stack([it[2] for it in items])
+    ves = torch.stack([it[3] for it in items])
+    return inp, target, center, ves
+
+
+@torch.no_grad()
+def _validate(model, val_batch, device):
+    model.eval()
+    inp, target, center, ves = [t.to(device) for t in val_batch]
+    out = model(inp)  # sortie BRUTE (pas de clamp -> pas de gradient mort)
+    loss, l1, _, _ = structure_loss(out, target, center, ves)
+    return float(l1.item())  # on suit le terme N2N pur (cohérent inter-epochs)
+
+
+def _train(model, ds, val_ref, device, epochs, lr, batch,
+           grad_clip=1.0, patience=40):
+    dl = DataLoader(ds, batch_size=batch, shuffle=True,
+                    num_workers=2, drop_last=True,
+                    worker_init_fn=_worker_init_fn)
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=lr, epochs=epochs,
         steps_per_epoch=len(dl), pct_start=0.2
     )
-    
-    val_stack, val_ves, offsets = val_ref
-    
+
+    # Lot de validation fixe (monitoring + best-checkpoint)
+    val_batch = _build_val_batch(ds)
+
     print(f"\n{'='*80}")
     print(f"DÉBUT DE L'ENTRAÎNEMENT N2N")
-    print(f"  Epochs: {epochs}")
-    print(f"  Batch size: {batch}")
-    print(f"  Learning rate: {lr}")
-    print(f"  Device: {device}")
+    print(f"  Epochs: {epochs} | Batch: {batch} | LR: {lr} | "
+          f"grad_clip: {grad_clip} | Device: {device}")
     print(f"{'='*80}\n")
-    
+
+    best_val = float("inf")
+    best_state = None
+    epochs_no_improve = 0
+
     for ep in range(epochs):
         model.train()
         tot = n2n_loss = edge_loss = bg_loss = 0.0
         nb = 0
-        
-        # Barre de progression pour les batches (une seule ligne)
+
         batch_bar = tqdm(dl, desc=f"Epoch {ep+1}/{epochs}",
                          leave=False, dynamic_ncols=True, mininterval=0.3)
-        
+
         for inp, target, center, ves in batch_bar:
             inp = inp.to(device)
             target = target.to(device)
             center = center.to(device)
             ves = ves.to(device)
-            
+
+            # IMPORTANT : on calcule la loss sur la sortie BRUTE.
+            # Clamper avant la loss annule le gradient hors [0,1]
+            # (clamp a un gradient nul) -> zones "mortes" qui n'apprennent plus.
+            # Le clamp [0,1] n'est appliqué qu'à l'inférence (_infer).
             out = model(inp)
-            out = torch.clamp(out, 0, 1)
-            
+
             loss, l1, edge, bg = structure_loss(out, target, center, ves)
-            
+
             if torch.isnan(loss) or torch.isinf(loss):
                 batch_bar.write(f"  WARNING: NaN/Inf loss à l'epoch {ep+1}")
                 continue
-            
+
             opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+            # grad-clip raisonnable (l'ancien 0.1 étranglait l'apprentissage)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
             scheduler.step()
-            
+
             tot += loss.item()
             n2n_loss += l1.item()
             edge_loss += edge.item()
             bg_loss += bg.item()
             nb += 1
-            
-            # Mise à jour de la barre (une seule ligne)
+
             batch_bar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'n2n': f'{l1.item():.4f}',
                 'edge': f'{edge.item():.4f}'
             })
-        
-        # Ferme proprement la barre AVANT d'écrire le résumé,
-        # sinon le print entre en conflit avec la barre et défile en boucle.
+
         batch_bar.close()
-        
-        # Calcul des moyennes
+
+        # ---- Validation + best-checkpoint + early stopping ----
+        val_l1 = _validate(model, val_batch, device)
+        improved = val_l1 < best_val - 1e-5
+        if improved:
+            best_val = val_l1
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
         if nb > 0:
-            avg_tot = tot / nb
-            avg_n2n = n2n_loss / nb
-            avg_edge = edge_loss / nb
-            avg_bg = bg_loss / nb
-            
-            # Résumé de l'epoch (tqdm.write : compatible avec d'éventuelles barres)
             tqdm.write(f"[EPOCH {ep+1:3d}/{epochs}] "
-                       f"Loss: {avg_tot:.5f} | "
-                       f"N2N: {avg_n2n:.5f} | "
-                       f"Edge: {avg_edge:.5f} | "
-                       f"BG: {avg_bg:.5f} | "
+                       f"Loss: {tot/nb:.5f} | N2N: {n2n_loss/nb:.5f} | "
+                       f"Edge: {edge_loss/nb:.5f} | BG: {bg_loss/nb:.5f} | "
+                       f"VAL(n2n): {val_l1:.5f}{'  <-- best' if improved else ''} | "
                        f"LR: {scheduler.get_last_lr()[0]:.2e}")
-    
+
+        if epochs_no_improve >= patience:
+            tqdm.write(f"  Early stopping : pas d'amélioration depuis "
+                       f"{patience} epochs (best VAL={best_val:.5f}).")
+            break
+
+    # Restaure le meilleur état observé en validation
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        tqdm.write(f"  Restauration du meilleur modèle (VAL n2n={best_val:.5f}).")
+
     print(f"\n{'='*80}")
     print("ENTRAÎNEMENT TERMINÉ")
     print(f"{'='*80}\n")
-    
+
     return model
 
 
@@ -581,7 +653,9 @@ if __name__ == "__main__":
                     help="Sauvegarde la vidéo débruitee")
     
     a = ap.parse_args()
-    
+
+    seed_everything(1234)
+
     if a.cmd == "train":
         train_n2n_folder(
             a.folder, a.model,
@@ -597,14 +671,23 @@ if __name__ == "__main__":
         )
     else:
         stack = vp.load_video_gray(a.video)
+
+        # VST + normalisation COHÉRENTES avec l'entraînement (preprocess_for_n2n).
+        # Sans cela, un modèle entraîné en domaine VST était appliqué en domaine
+        # brut -> décalage de domaine et résultats dégradés.
+        nm = vp.NoiseModel.estimate(stack)
+        stack = nm.forward(stack)
+        vlo, vhi = np.percentile(stack, [0.5, 99.9])
+        stack = np.clip((stack - vlo) / (vhi - vlo + 1e-6), 0, 1).astype(np.float32)
+
         stack, _ = vp.register_stack(stack)
         stack = np.clip(stack, 0, 1)
-        
+
         video_out = None
         if a.save_video:
             base = os.path.splitext(a.video)[0]
             video_out = f"{base}_denoised_n2n.avi"
-        
+
         den = denoise_stack_n2n(
             stack,
             epochs=a.epochs,
@@ -613,10 +696,16 @@ if __name__ == "__main__":
             min_pair_distance=a.min_distance,
             pretrained=a.model,
             device=a.device,
-            save_video=a.save_video,
-            video_path=video_out
+            save_video=False  # on sauve après VST inverse, ci-dessous
         )
-        
-        vp.save_image("n2n_projection_test.png", 
+
+        # VST inverse pour revenir dans l'espace image d'origine
+        den = np.clip(nm.inverse(den * (vhi - vlo) + vlo), 0, 1)
+
+        if a.save_video and video_out:
+            vp.save_video_gray(video_out, den)
+            print(f"  Vidéo débruitée sauvegardée : {video_out}")
+
+        vp.save_image("n2n_projection_test.png",
                       vp.usm_mean_projection(den, usm_when="post"))
         print("OK -> n2n_projection_test.png")
